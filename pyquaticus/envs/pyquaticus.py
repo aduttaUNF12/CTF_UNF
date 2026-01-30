@@ -1722,11 +1722,15 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
                                 self.world_to_screen(red_player_pos),
                                 width=self.a2a_line_width
                             )
+        self._draw_hud()
 
         if self.render_mode:
             pygame.event.pump()
             self.clock.tick(self.render_fps)
             pygame.display.flip()
+
+    def _draw_hud(self):
+        pass
 
     def world_to_screen(self, pos):
         screen_pos = self.pixel_size * np.asarray(pos)

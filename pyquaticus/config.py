@@ -6,8 +6,8 @@ from pyquaticus.utils.utils import get_screen_res
 MAX_SPEED = 1.5
 
 config_dict_std = {
-    "world_size": [160.0, 80.0],  # meters
-    "pixel_size": 10,  # pixels/meter
+    "world_size": [120.0, 60.0],  # 160, 80 meters
+    "pixel_size": 8,  # 10 pixels/meter
     "agent_radius": 2.0,  # meters
     "catch_radius": 10.0,  # meters
     "flag_keepout": 5.0,  # minimum distance (meters) between agent and flag centers
