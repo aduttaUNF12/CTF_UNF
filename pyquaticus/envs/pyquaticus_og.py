@@ -55,8 +55,6 @@ from pyquaticus.utils.utils import (
 )
 import warnings
 
-from blocks.block1 import block1_environment_initialization, Config
-
 class PyQuaticusEnvBase(ParallelEnv, ABC):
     """
     ### Description.
@@ -1334,24 +1332,6 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
             np.array(flag_locations)
         )
 
-        # BLOCK 1 INTEGRATION
-        cfg = Config(num_robots=self.num_agents)
-        self.global_state = block1_environment_initialization(cfg)
-
-        print("\nBlock1 positions injected into PyQuaticus:")
-        for rid, data in self.global_state.robots.items():
-            print(rid, data["position"])
-
-        # Convert 10x10 grid to world_size scaling
-        grid_max = 9  # since Block1 uses 0–9
-        x_scale = self.world_size[0] / (grid_max + 1)
-        y_scale = self.world_size[1] / (grid_max + 1)
-
-        for i, rid in enumerate(self.global_state.robots):
-            grid_x, grid_y = self.global_state.robots[rid]["position"]
-            agent_positions[i][0] = grid_x * x_scale
-            agent_positions[i][1] = grid_y * y_scale
-
         self.state = {
             "agent_position": agent_positions,
             "prev_agent_position": copy.deepcopy(agent_positions),
@@ -1749,39 +1729,8 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
             self.clock.tick(self.render_fps)
             pygame.display.flip()
 
-    #Draws score board and controls
     def _draw_hud(self):
-        if self.screen is None:
-            return
-
-        font_score = pygame.font.SysFont(None, 24)
-        font_ctrls = pygame.font.SysFont(None, 16)
-
-        score = self.game_score
-
-        # Scores
-        self.screen.blit(
-            font_score.render(
-                f"Red Captures: {score['red_captures']}", True, (0, 0, 0)
-            ),
-            (20, 20),
-        )
-
-        self.screen.blit(
-            font_score.render(
-                f"Blue Captures: {score['blue_captures']}", True, (0, 0, 0)
-            ),
-            (self.screen.get_width() // 2 + 5, 20),
-        )
-
-        # Controls
-        y = self.screen.get_height() - 50
-        for line in ("SPACE = Pause / Resume", "ESC = Quit"):
-            self.screen.blit(
-                font_ctrls.render(line, True, (0, 0, 0)),
-                (20, y),
-            )
-            y += 18
+        pass
 
     def world_to_screen(self, pos):
         screen_pos = self.pixel_size * np.asarray(pos)

@@ -5,7 +5,7 @@ from pyquaticus.envs.pyquaticus import PyQuaticusEnv
 def main():
     pygame.init()
 
-    team_size = int(input("Enter team size (1–6): "))
+    team_size = int(input("Enter team size (1–5): "))
 
     env = PyQuaticusEnv(
         team_size=team_size,
