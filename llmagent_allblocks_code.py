@@ -1,0 +1,399 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any
+import random
+import math
+
+# -----------------------------
+# Types / data structures
+# -----------------------------
+
+Vec2 = Tuple[int, int]
+RobotId = str
+TeamId = str
+
+@dataclass
+class LocalObservation:
+    robot_id: RobotId
+    position: Vec2
+    nearby: List[str] = field(default_factory=list)
+    teammates: List[Tuple[RobotId, Vec2]] = field(default_factory=list)
+    hazards: List[str] = field(default_factory=list)
+    messages_in: List[str] = field(default_factory=list)
+
+@dataclass
+class GlobalState:
+    t: int
+    robots: Dict[RobotId, Dict[str, Any]]  # {position: (x,y), hp: int, team: optional}
+    map_summary: str
+    history: Dict[str, Any] = field(default_factory=lambda: {
+        "actions": [],           # [{t, robot_id, action}]
+        "rewards": [],           # [{t, value, reason}]
+        "human_constraints": [], # [str]
+        "llm_summaries": []      # [str]
+    })
+
+@dataclass
+class StrategyCandidate:
+    text: str
+    risks: List[str]
+    uncertainties: List[str]
+
+@dataclass
+class HumanPlan:
+    priorities: List[str]
+    safety_constraints: List[str]
+    mission_goals: List[str]
+    approved_strategies: List[str]
+
+@dataclass
+class Subgoal:
+    subgoal_id: str
+    description: str
+    vector: List[float]  # placeholder embedding/encoding
+
+@dataclass
+class HRLAction:
+    teams: Dict[TeamId, List[RobotId]]
+    subgoals: Dict[TeamId, Subgoal]
+    request_replan: bool
+
+@dataclass
+class Reward:
+    value: float
+    breakdown: List[str]
+
+@dataclass
+class Config:
+    num_robots: int = 12
+    max_steps_per_episode: int = 50
+    enable_llm: bool = True
+    enable_human_intervention: bool = True
+    log_every: int = 5
+    seed: Optional[int] = 42
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+def encode_subgoal(desc: str) -> List[float]:
+    # placeholder "vector" encoder (replace with embedding model)
+    s = sum(ord(c) for c in desc)
+    return [float(s % 97), float((s * 7) % 101), float((s * 13) % 103)]
+
+def pick_direction_from_vector(v: List[float]) -> str:
+    # deterministic primitive action from vector
+    d = int(v[0]) % 4
+    return ["MOVE_UP", "MOVE_RIGHT", "MOVE_DOWN", "MOVE_LEFT"][d]
+
+
+# ==========================================================
+# BLOCK 1: ENVIRONMENT INITIALIZATION
+# ==========================================================
+def block1_environment_initialization(cfg: Config) -> GlobalState:
+    """
+    Loads environment, spawns N robots, resets map, initializes buffers/logging.
+    """
+    if cfg.seed is not None:
+        random.seed(cfg.seed)
+
+    robots: Dict[RobotId, Dict[str, Any]] = {}
+    for i in range(1, cfg.num_robots + 1):
+        rid = f"R{i}"
+        robots[rid] = {"position": (random.randint(0, 9), random.randint(0, 9)), "hp": 100}
+
+    gs = GlobalState(
+        t=0,
+        robots=robots,
+        map_summary="10x10 grid world; obstacles randomized; objective unknown",
+    )
+    return gs
+
+
+# ==========================================================
+# BLOCK 2: STATE COLLECTION (RAW MULTI-ROBOT OBSERVATIONS)
+# ==========================================================
+def block2_state_collection(gs: GlobalState) -> List[LocalObservation]:
+    """
+    Each robot collects partial local observation (nearby objects, hazards).
+    """
+    ids = list(gs.robots.keys())
+
+    local_obs: List[LocalObservation] = []
+    for rid in ids:
+        pos = gs.robots[rid]["position"]
+
+        teammates = [(tid, gs.robots[tid]["position"]) for tid in ids if tid != rid][:3]
+        nearby = [x for x in ["wall", "crate", "enemy?"] if random.random() < 0.4]
+        hazards = [x for x in ["red_zone", "minefield"] if random.random() < 0.2]
+
+        local_obs.append(LocalObservation(
+            robot_id=rid,
+            position=pos,
+            nearby=nearby,
+            teammates=teammates,
+            hazards=hazards,
+            messages_in=[]
+        ))
+
+    return local_obs
+
+
+# ==========================================================
+# BLOCK 3: GLOBAL STATE ENCODING (CTDE)
+# ==========================================================
+def block3_global_state_encoding(gs: GlobalState, local_obs: List[LocalObservation]) -> GlobalState:
+    """
+    Combines local observations into a centralized global representation.
+    """
+    hazard_count = sum(len(o.hazards) for o in local_obs)
+    enemy_signals = sum(1 for o in local_obs if "enemy?" in o.nearby)
+
+    gs.map_summary = f"{gs.map_summary} | hazards_seen={hazard_count} | enemy_signals={enemy_signals}"
+    return gs
+
+
+# ==========================================================
+# BLOCK 4: LLM STATE SUMMARIZATION
+# ==========================================================
+def block4_llm_state_summarization(gs: GlobalState, cfg: Config) -> Tuple[str, List[StrategyCandidate]]:
+    """
+    Produces natural-language summary and candidate strategies (stub for real LLM).
+    """
+    if not cfg.enable_llm:
+        return "", []
+
+    robot_count = len(gs.robots)
+    llm_summary = f"t={gs.t}. Robots active={robot_count}. Map: {gs.map_summary}"
+
+    strategies = [
+        StrategyCandidate(
+            text="Team A defend; Team B flank right; Team C explore north.",
+            risks=["Possible hazard exposure", "Higher communication overhead"],
+            uncertainties=["Enemy locations partially observed", "Objective location unknown"]
+        ),
+        StrategyCandidate(
+            text="Scout corners with 2 robots; others hold and communicate.",
+            risks=["Scouts could isolate", "Defense might weaken"],
+            uncertainties=["Obstacle density unknown"]
+        )
+    ]
+
+    gs.history["llm_summaries"].append(llm_summary)
+    return llm_summary, strategies
+
+
+# ==========================================================
+# BLOCK 5: HUMAN STRATEGY INTERVENTION
+# ==========================================================
+def block5_human_intervention(strategies: List[StrategyCandidate], cfg: Config) -> HumanPlan:
+    """
+    Human approves/modifies strategies and adds constraints.
+    (Stub: auto-approves first strategy + adds safety constraint.)
+    """
+    if not cfg.enable_human_intervention:
+        return HumanPlan([], [], [], [])
+
+    approved = strategies[0].text if strategies else "No strategy available"
+    plan = HumanPlan(
+        priorities=["Defense > Capture"],
+        safety_constraints=["Avoid red_zone"],
+        mission_goals=["Secure perimeter", "Locate objective"],
+        approved_strategies=[approved]
+    )
+    return plan
+
+
+# ==========================================================
+# BLOCK 6: HIGH-LEVEL RL MANAGER (HRL META-POLICY)
+# ==========================================================
+def block6_high_level_rl_manager(gs: GlobalState, human_plan: HumanPlan) -> HRLAction:
+    """
+    Decides teams, assigns subgoals, sets replan requests (stub heuristic).
+    """
+    ids = list(gs.robots.keys())
+    teams: Dict[TeamId, List[RobotId]] = {
+        "A": [rid for i, rid in enumerate(ids) if i % 3 == 0],
+        "B": [rid for i, rid in enumerate(ids) if i % 3 == 1],
+        "C": [rid for i, rid in enumerate(ids) if i % 3 == 2],
+    }
+
+    subgoals: Dict[TeamId, Subgoal] = {
+        "A": Subgoal("hold_r1", "Hold region R1 (defense)", encode_subgoal("Hold region R1")),
+        "B": Subgoal("flank_right", "Flank right corridor", encode_subgoal("Flank right corridor")),
+        "C": Subgoal("scout_north", "Scout unexplored north", encode_subgoal("Scout north")),
+    }
+
+    # Example: could request replan if hazards are high (stub logic)
+    request_replan = False
+    return HRLAction(teams=teams, subgoals=subgoals, request_replan=request_replan)
+
+
+# ==========================================================
+# BLOCK 7: SUBGOAL DISPATCHING TO ROBOT TEAMS
+# ==========================================================
+def block7_subgoal_dispatching(gs: GlobalState, hrl: HRLAction) -> None:
+    """
+    Attaches team id to each robot so low-level knows which subgoal applies.
+    """
+    for team_id, members in hrl.teams.items():
+        for rid in members:
+            gs.robots[rid]["team"] = team_id
+
+
+# ==========================================================
+# BLOCK 8: LOW-LEVEL MULTI-AGENT RL EXECUTION (MAPPO/MASAC)
+# ==========================================================
+def block8_low_level_execution(
+    gs: GlobalState,
+    local_obs: List[LocalObservation],
+    hrl: HRLAction
+) -> List[Dict[str, Any]]:
+    """
+    Returns primitive action per robot (stub policy).
+    """
+    actions: List[Dict[str, Any]] = []
+    for obs in local_obs:
+        rid = obs.robot_id
+        team = gs.robots[rid].get("team")
+        sg = hrl.subgoals.get(team) if team else None
+
+        # If hazard locally seen, hold
+        if obs.hazards:
+            actions.append({"robot_id": rid, "action": "HOLD", "message": "Hazard detected"})
+            continue
+
+        if sg is None:
+            actions.append({"robot_id": rid, "action": "MOVE_RIGHT", "message": "No subgoal"})
+            continue
+
+        primitive = pick_direction_from_vector(sg.vector)
+        actions.append({"robot_id": rid, "action": primitive, "message": f"Subgoal={sg.subgoal_id}"})
+
+    return actions
+
+
+# ==========================================================
+# BLOCK 9: ENVIRONMENT TRANSITION
+# ==========================================================
+def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]) -> Reward:
+    """
+    Applies actions -> updates positions -> computes reward -> updates history.
+    """
+    reward_val = 0.0
+    breakdown: List[str] = []
+
+    for a in actions:
+        rid = a["robot_id"]
+        act = a["action"]
+        x, y = gs.robots[rid]["position"]
+        before = (x, y)
+
+        if act == "MOVE_UP":
+            y = clamp(y - 1, 0, 9)
+        elif act == "MOVE_DOWN":
+            y = clamp(y + 1, 0, 9)
+        elif act == "MOVE_LEFT":
+            x = clamp(x - 1, 0, 9)
+        elif act == "MOVE_RIGHT":
+            x = clamp(x + 1, 0, 9)
+        elif act == "HOLD":
+            pass
+        # ATTACK/COLLECT/COMMUNICATE can be added later
+
+        gs.robots[rid]["position"] = (x, y)
+
+        # simple shaping reward: +0.1 if moved
+        if (x, y) != before:
+            reward_val += 0.1
+
+        gs.history["actions"].append({"t": gs.t, "robot_id": rid, "action": act})
+
+    breakdown.append(f"task_progress={reward_val:.2f}")
+    gs.history["rewards"].append({"t": gs.t, "value": reward_val, "reason": "progress"})
+
+    gs.t += 1
+    return Reward(value=reward_val, breakdown=breakdown)
+
+
+# ==========================================================
+# BLOCK 10: CHECK FOR STRATEGIC CHANGES
+# ==========================================================
+def block10_check_strategic_changes(gs: GlobalState) -> bool:
+    """
+    Determines if replanning is needed (periodic stub).
+    """
+    return gs.t > 0 and (gs.t % 10 == 0)
+
+
+# ==========================================================
+# BLOCK 11: LEARNING & POLICY UPDATES
+# ==========================================================
+def block11_learning_and_updates(gs: GlobalState) -> None:
+    """
+    Placeholder for PPO/A2C updates (high-level) and MAPPO/MASAC updates (low-level).
+    """
+    # In a real implementation:
+    # - collect trajectories
+    # - compute advantages/returns
+    # - update policy networks
+    gs.history.setdefault("learning_notes", [])
+    gs.history["learning_notes"].append(f"Learning update executed at t={gs.t} (stub)")
+
+
+# ==========================================================
+# BLOCK 12: TERMINATION CHECK
+# ==========================================================
+def block12_termination_check(gs: GlobalState, cfg: Config) -> bool:
+    """
+    Checks episode termination conditions.
+    """
+    return gs.t >= cfg.max_steps_per_episode
+
+
+# -----------------------------
+# Example runner (optional)
+# -----------------------------
+def run_episode(cfg: Config) -> GlobalState:
+    gs = block1_environment_initialization(cfg)
+
+    while True:
+        local_obs = block2_state_collection(gs)
+        gs = block3_global_state_encoding(gs, local_obs)
+        llm_summary, strategies = block4_llm_state_summarization(gs, cfg)
+        human_plan = block5_human_intervention(strategies, cfg)
+        gs.history["human_constraints"].extend(human_plan.safety_constraints)
+
+        hrl = block6_high_level_rl_manager(gs, human_plan)
+        block7_subgoal_dispatching(gs, hrl)
+        robot_actions = block8_low_level_execution(gs, local_obs, hrl)
+        reward = block9_environment_transition(gs, robot_actions)
+
+        should_replan = block10_check_strategic_changes(gs) or hrl.request_replan
+
+        # periodic learning
+        if gs.t > 0 and gs.t % 20 == 0:
+            block11_learning_and_updates(gs)
+
+        if cfg.log_every and gs.t % cfg.log_every == 0:
+            print(f"[t={gs.t}] reward={reward.value:.2f} replan={should_replan}")
+
+        if block12_termination_check(gs, cfg):
+            break
+
+    return gs
+
+
+if __name__ == "__main__":
+    cfg = Config(num_robots=12, max_steps_per_episode=30, enable_llm=True, enable_human_intervention=True)
+    final_state = run_episode(cfg)
+    print("\nDONE. Final t =", final_state.t)
+    print("Actions logged:", len(final_state.history["actions"]))
+    print("Rewards logged:", len(final_state.history["rewards"]))
+
+
+
