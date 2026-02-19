@@ -55,7 +55,7 @@ from pyquaticus.utils.utils import (
 )
 import warnings
 
-from blocks.block1 import block1_environment_initialization, Config
+from all_blocks import *
 
 class PyQuaticusEnvBase(ParallelEnv, ABC):
     """
@@ -510,10 +510,12 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
         reward_config: dict = None,
         config_dict=config_dict_std,
         render_mode: Optional[str] = None,
-        render_agent_ids: Optional[bool] = False
+        render_agent_ids: Optional[bool] = False,
+        start_pos = "default"
     ):
         super().__init__()
         self.config_dict = config_dict
+        self.start_pos = start_pos
 
         #Game score used to determine winner of game for MCTF competition
         #blue_captures: Represents the number of times the blue team has grabbed reds flag and brought it back to their side
@@ -1333,24 +1335,20 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
         agent_positions, agent_spd_hdg, agent_on_sides = self._generate_agent_starts(
             np.array(flag_locations)
         )
+        
+        if self.start_pos == "random":
+            # BLOCK 1 INTEGRATION
+            cfg = Config(num_robots=self.num_agents)
+            self.global_state = block1_environment_initialization(cfg)
 
-        # BLOCK 1 INTEGRATION
-        cfg = Config(num_robots=self.num_agents)
-        self.global_state = block1_environment_initialization(cfg)
+            print("\nBlock1 positions injected into PyQuaticus:")
+            for rid, data in self.global_state.robots.items():
+                print(rid, data["position"])
 
-        print("\nBlock1 positions injected into PyQuaticus:")
-        for rid, data in self.global_state.robots.items():
-            print(rid, data["position"])
-
-        # Convert 10x10 grid to world_size scaling
-        grid_max = 9  # since Block1 uses 0–9
-        x_scale = self.world_size[0] / (grid_max + 1)
-        y_scale = self.world_size[1] / (grid_max + 1)
-
-        for i, rid in enumerate(self.global_state.robots):
-            grid_x, grid_y = self.global_state.robots[rid]["position"]
-            agent_positions[i][0] = grid_x * x_scale
-            agent_positions[i][1] = grid_y * y_scale
+            for i, rid in enumerate(self.global_state.robots):
+                grid_x, grid_y = self.global_state.robots[rid]["position"]
+                agent_positions[i][0] = grid_x
+                agent_positions[i][1] = grid_y
 
         self.state = {
             "agent_position": agent_positions,

@@ -1,16 +1,30 @@
 import sys
 import pygame
 from pyquaticus.envs.pyquaticus import PyQuaticusEnv
+from all_blocks import *
 
 def main():
     pygame.init()
 
-    team_size = int(input("Enter team size (1–6): "))
+    # Prompt user for team size and position
+    team_size = int(input("Enter team size (1–6): \n"))
+    pos_choice = input(f"Select starting position:\n" + 
+                       "(1) Random\n" +
+                       "(Any other key) Default - Straight line\n")
+
+    if pos_choice == '1':
+        start_pos = "random"
+    else:
+        start_pos = "default"
+
+    # Red team is enemy - keep random for now and wait for strategy
+    # Blue team uses block1 moves
 
     env = PyQuaticusEnv(
         team_size=team_size,
         render_mode="human",
-        render_agent_ids=True
+        render_agent_ids=True,
+        start_pos=start_pos
     )
 
     env.reset()
