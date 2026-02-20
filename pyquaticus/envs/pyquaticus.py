@@ -465,8 +465,6 @@ class PyQuaticusEnvBase(ParallelEnv, ABC):
             self._walls[int(Team.BLUE_TEAM)] = rotate_walls(all_walls, 2)
 
 
-
-
 class PyQuaticusEnv(PyQuaticusEnvBase):
     """
     ### Description.
@@ -1335,7 +1333,7 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
         agent_positions, agent_spd_hdg, agent_on_sides = self._generate_agent_starts(
             np.array(flag_locations)
         )
-        
+
         if self.start_pos == "random":
             # BLOCK 1 INTEGRATION
             cfg = Config(num_robots=self.num_agents)

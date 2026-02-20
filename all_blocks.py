@@ -102,9 +102,15 @@ def block1_environment_initialization(cfg: Config) -> GlobalState:
         random.seed(cfg.seed)
 
     robots: Dict[RobotId, Dict[str, Any]] = {}
-    for i in range(1, cfg.num_robots + 1):
+    # Random start positions for BLUE Team
+    for i in range(1, (cfg.num_robots // 2) + 1):
         rid = f"R{i}"
-        robots[rid] = {"position": (random.randint(0, 119), random.randint(0, 59)), "hp": 100}
+        robots[rid] = {"position": (random.randint(60, 119), random.randint(0, 59)), "hp": 100}
+    
+    # Random start positions for RED Team
+    for i in range((cfg.num_robots // 2) + 1, cfg.num_robots + 1):
+        rid = f"R{i}"
+        robots[rid] = {"position": (random.randint(0, 59), random.randint(0, 59)), "hp": 100}
 
     gs = GlobalState(
         t=0,
