@@ -12,6 +12,18 @@ Vec2 = Tuple[int, int]
 RobotId = str
 TeamId = str
 
+DISCRETE_ACTIONS = {
+    "W": 0,
+    "NW": 1,
+    "N": 2,
+    "NE": 3,
+    "E": 4,
+    "SE": 5,
+    "S": 6,
+    "SW": 7,
+    "HOLD": 8,
+}
+
 @dataclass
 class LocalObservation:
     robot_id: RobotId
@@ -87,8 +99,8 @@ def encode_subgoal(desc: str) -> List[float]:
 
 def pick_direction_from_vector(v: List[float]) -> str:
     # deterministic primitive action from vector
-    d = int(v[0]) % 4
-    return ["MOVE_UP", "MOVE_RIGHT", "MOVE_DOWN", "MOVE_LEFT"][d]
+    d = int(v[0]) % 8
+    return ["W", "NW", "N", "NE", "E", "SE", "S", "SW"][d]
 
 
 # ==========================================================
@@ -252,7 +264,7 @@ def block7_subgoal_dispatching(gs: GlobalState, hrl: HRLAction) -> None:
 
 
 # ==========================================================
-# BLOCK 8: LOW-LEVEL MULTI-AGENT RL EXECUTION (MAPPO/MASAC)
+# BLOCK 8: LOW-LEVEL MULTI-AGENT RL EXECUTION (MAPPO/MASAC) -- SKIP FOR NOW
 # ==========================================================
 def block8_low_level_execution(
     gs: GlobalState,
@@ -270,21 +282,21 @@ def block8_low_level_execution(
 
         # If hazard locally seen, hold
         if obs.hazards:
-            actions.append({"robot_id": rid, "action": "HOLD", "message": "Hazard detected"})
+            actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS["HOLD"], "message": "Hazard detected"})
             continue
 
         if sg is None:
-            actions.append({"robot_id": rid, "action": "MOVE_RIGHT", "message": "No subgoal"})
+            actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS["E"], "message": "No subgoal"})
             continue
 
         primitive = pick_direction_from_vector(sg.vector)
-        actions.append({"robot_id": rid, "action": primitive, "message": f"Subgoal={sg.subgoal_id}"})
+        actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS[primitive], "message": f"Subgoal={sg.subgoal_id}"})
 
     return actions
 
 
 # ==========================================================
-# BLOCK 9: ENVIRONMENT TRANSITION
+# BLOCK 9: ENVIRONMENT TRANSITION -- SKIP FOR NOW
 # ==========================================================
 def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]) -> Reward:
     """
