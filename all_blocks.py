@@ -104,6 +104,34 @@ def pick_direction_from_vector(v: List[float]) -> str:
     return ["W", "NW", "N", "NE", "E", "SE", "S", "SW"][d]
 
 
+# Grid dimensions matching pyquaticus world_size [120, 60] -> rows=60, cols=120 (row=y, col=x)
+# Field: 120 m x 60 m. Agent (from config): radius 2.0 m, diameter 4.0 m. 1 grid cell = 1 m.
+GRID_ROWS = 60
+GRID_COLS = 120
+# Boundary buffer in grid cells: keep paths at least this many cells from walls.
+# Set to agent_radius (2) so agents can get as close to boundaries as the env allows.
+AGENT_RADIUS_CELLS = 2
+
+# (drow, dcol) for 8 directions: N, NE, E, SE, S, SW, W, NW
+_DIRECTION_TO_OFFSET = {
+    "N": (-1, 0), "NE": (-1, 1), "E": (0, 1), "SE": (1, 1),
+    "S": (1, 0), "SW": (1, -1), "W": (0, -1), "NW": (-1, -1),
+}
+_OFFSET_TO_DIRECTION = {v: k for k, v in _DIRECTION_TO_OFFSET.items()}
+
+
+def _world_to_grid(x: float, y: float) -> Tuple[int, int]:
+    """Convert world (x, y) to grid (row, col)."""
+    row = clamp(int(round(y)), 0, GRID_ROWS - 1)
+    col = clamp(int(round(x)), 0, GRID_COLS - 1)
+    return (row, col)
+
+
+def _path_step_to_direction(dr: int, dc: int) -> str:
+    """Map (drow, dcol) from one path cell to next to direction string."""
+    return _OFFSET_TO_DIRECTION.get((dr, dc), "HOLD")
+
+
 # ==========================================================
 # BLOCK 1: ENVIRONMENT INITIALIZATION
 # ==========================================================
@@ -265,27 +293,30 @@ def block7_subgoal_dispatching(gs: GlobalState, hrl: HRLAction) -> None:
 
 
 # ==========================================================
-# BLOCK 8: ASTAR
+# BLOCK 8: ASTAR (pathfinding utility)
 # ==========================================================
-def block8_astar(grid, start, goal):
- 
+def block8_astar(
+    grid: List[List[int]], start: Tuple[int, int], goal: Tuple[int, int], eight_connected: bool = True
+) -> List[Tuple[int, int]]:
+    """
+    A* pathfinding on a 2D grid. grid[row][col] with 1 = obstacle.
+    Returns path from start to goal (list of (row, col)), or [] if no path.
+    If eight_connected, uses 8 neighbors (N, NE, E, SE, S, SW, W, NW).
+    """
     rows = len(grid)
     cols = len(grid[0])
- 
-    def heuristic(a, b):
-        return abs(a[0]-b[0]) + abs(a[1]-b[1])
- 
+
+    def heuristic(a: Vec2, b: Vec2) -> float:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
     open_set = []
     heapq.heappush(open_set, (0, start))
- 
     came_from = {}
- 
     g_score = {start: 0}
- 
+
     while open_set:
- 
         current = heapq.heappop(open_set)[1]
- 
+
         if current == goal:
             path = []
             while current in came_from:
@@ -293,32 +324,129 @@ def block8_astar(grid, start, goal):
                 current = came_from[current]
             path.append(start)
             return path[::-1]
- 
-        neighbors = [
-            (current[0]+1,current[1]),
-            (current[0]-1,current[1]),
-            (current[0],current[1]+1),
-            (current[0],current[1]-1)
-        ]
- 
-        for n in neighbors:
- 
+
+        if eight_connected:
+            neighbor_list = [
+                (current[0] + dr, current[1] + dc)
+                for dr, dc in _DIRECTION_TO_OFFSET.values()
+            ]
+        else:
+            neighbor_list = [
+                (current[0] + 1, current[1]), (current[0] - 1, current[1]),
+                (current[0], current[1] + 1), (current[0], current[1] - 1),
+            ]
+
+        for n in neighbor_list:
             if 0 <= n[0] < rows and 0 <= n[1] < cols:
- 
-                if grid[n[0]][n[1]] == 1:  # obstacle
+                if grid[n[0]][n[1]] == 1:
                     continue
- 
-                tentative = g_score[current] + 1
- 
+                cost = 1.414 if (eight_connected and n[0] != current[0] and n[1] != current[1]) else 1.0
+                tentative = g_score[current] + cost
                 if n not in g_score or tentative < g_score[n]:
- 
                     came_from[n] = current
                     g_score[n] = tentative
- 
                     f = tentative + heuristic(n, goal)
                     heapq.heappush(open_set, (f, n))
- 
+
     return []
+
+
+def _build_grid(
+    rows: int, cols: int,
+    obstacles: Optional[List[Tuple[int, int]]] = None,
+    boundary_buffer: int = 0,
+) -> List[List[int]]:
+    """Build a grid (0=free, 1=obstacle). Optional obstacles list. boundary_buffer: cells
+    from each edge to mark as obstacles (keeps paths inside play area per pyquaticus)."""
+    grid = [[0] * cols for _ in range(rows)]
+    if boundary_buffer > 0:
+        for r in range(rows):
+            for c in range(cols):
+                if r < boundary_buffer or r >= rows - boundary_buffer:
+                    grid[r][c] = 1
+                elif c < boundary_buffer or c >= cols - boundary_buffer:
+                    grid[r][c] = 1
+    if obstacles:
+        for r, c in obstacles:
+            if 0 <= r < rows and 0 <= c < cols:
+                grid[r][c] = 1
+    return grid
+
+
+# ==========================================================
+# BLOCK 8: LOW-LEVEL EXECUTION (A* pathfinding -> discrete action per robot)
+# ==========================================================
+def block8_low_level_execution(
+    gs: GlobalState, local_obs: List[LocalObservation], hrl: HRLAction,
+    grid_rows: int = GRID_ROWS, grid_cols: int = GRID_COLS,
+    opponent_flag_world: Optional[Tuple[float, float]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Uses A* to plan a path toward a goal for each robot, then returns the first
+    step direction (W, NW, N, NE, E, SE, S, SW, or HOLD).
+    If opponent_flag_world (x, y) is provided, blue agents path toward that
+    position (CTF: go to opponent's flag). Otherwise uses subgoal-derived offset.
+    Boundary buffer (2 cells) keeps paths inside play area to avoid OOB teleport.
+    """
+    use_flag_goal = opponent_flag_world is not None
+    # boundary_buffer = agent radius in cells so agents can get as close to walls as allowed
+    boundary_buffer = AGENT_RADIUS_CELLS if use_flag_goal else 0
+    grid = _build_grid(grid_rows, grid_cols, boundary_buffer=boundary_buffer)
+    robot_actions: List[Dict[str, Any]] = []
+    goal_offset_cells = 15
+
+    for o in local_obs:
+        rid = o.robot_id
+        team_id = gs.robots.get(rid, {}).get("team")
+        if team_id is None or team_id not in hrl.subgoals:
+            robot_actions.append({"robot_id": rid, "action": "HOLD"})
+            continue
+
+        subgoal = hrl.subgoals[team_id]
+        fallback_direction = pick_direction_from_vector(subgoal.vector)
+        pos = gs.robots.get(rid, {}).get("position", (0, 0))
+        x, y = pos
+        start = _world_to_grid(x, y)
+
+        if use_flag_goal:
+            goal = _world_to_grid(opponent_flag_world[0], opponent_flag_world[1])
+        else:
+            drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
+            goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
+            goal_col = clamp(start[1] + goal_offset_cells * dcol, 0, grid_cols - 1)
+            goal = (goal_row, goal_col)
+
+        if start == goal:
+            robot_actions.append({"robot_id": rid, "action": "HOLD"})
+            continue
+
+        path = block8_astar(grid, start, goal, eight_connected=True)
+        if len(path) >= 2:
+            dr = path[1][0] - path[0][0]
+            dc = path[1][1] - path[0][1]
+            direction = _path_step_to_direction(dr, dc)
+        else:
+            direction = fallback_direction
+
+        # Stronger boundary avoidance: if we're already near a wall, do not
+        # choose a direction that drives us closer to that wall. Nudge the
+        # direction back toward the interior instead.
+        row, col = start
+        margin = (boundary_buffer + 1) if use_flag_goal else 1
+
+        if row < margin and direction in ("N", "NW", "NE"):
+            direction = "S"
+        elif row > grid_rows - margin - 1 and direction in ("S", "SW", "SE"):
+            direction = "N"
+
+        if col < margin and direction in ("W", "NW", "SW"):
+            direction = "E"
+        elif col > grid_cols - margin - 1 and direction in ("E", "NE", "SE"):
+            direction = "W"
+
+        robot_actions.append({"robot_id": rid, "action": direction})
+
+    return robot_actions
 
 
 # ==========================================================
