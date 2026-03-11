@@ -380,12 +380,15 @@ def block8_low_level_execution(
     gs: GlobalState, local_obs: List[LocalObservation], hrl: HRLAction,
     grid_rows: int = GRID_ROWS, grid_cols: int = GRID_COLS,
     opponent_flag_world: Optional[Tuple[float, float]] = None,
+    own_flag_world: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Uses A* to plan a path toward a goal for each robot, then returns the first
     step direction (W, NW, N, NE, E, SE, S, SW, or HOLD).
     If opponent_flag_world (x, y) is provided, blue agents path toward that
-    position (CTF: go to opponent's flag). Otherwise uses subgoal-derived offset.
+    position (CTF: go to opponent's flag / red zone). If own_flag_world is also
+    provided and gs.robots[rid]["has_flag"] is True, that agent paths toward
+    own_flag_world (return home to score). Otherwise uses subgoal-derived offset.
     Boundary buffer (2 cells) keeps paths inside play area to avoid OOB teleport.
     """
     use_flag_goal = opponent_flag_world is not None
@@ -409,7 +412,12 @@ def block8_low_level_execution(
         start = _world_to_grid(x, y)
 
         if use_flag_goal:
-            goal = _world_to_grid(opponent_flag_world[0], opponent_flag_world[1])
+            # If agent has flag, path to own home zone; else path to opponent zone
+            if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
+                goal_world = own_flag_world
+            else:
+                goal_world = opponent_flag_world
+            goal = _world_to_grid(goal_world[0], goal_world[1])
         else:
             drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
             goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
