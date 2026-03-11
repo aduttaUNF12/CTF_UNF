@@ -110,11 +110,13 @@ def get_std_config() -> dict:
     return copy.deepcopy(config_dict_std)
 
 
-# action space key combos
 # maps discrete action id to (speed, heading)
 ACTION_MAP = []
-for spd in [MAX_SPEED, MAX_SPEED / 2.0]:
-    for hdg in range(180, -180, -45):
-        ACTION_MAP.append([spd, hdg])
-# add a none action
+
+# 8 compass directions at full speed
+for hdg in range(180, -180, -45):
+    ACTION_MAP.append([MAX_SPEED, hdg])
+
+# Hold action
 ACTION_MAP.append([0.0, 0.0])
+
