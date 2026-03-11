@@ -70,10 +70,9 @@ class PyQuaticusEnvBase(ParallelEnv, ABC):
     1. converting from discrete actions to a desired speed/heading command
     2. converting from raw states in Player objects to a normalized observation space
 
-    ### Action Space
+    ### Action Space -- EDITED
     A discrete action space with all combinations of
-    max speed, half speed; and
-    45 degree heading intervals
+    45 degree heading intervals in MAX SPEED
 
     ### Observation Space
 
@@ -686,8 +685,12 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
             self._check_untag()
         self._set_dones()
 
-        if self.message and self.render_mode:
-            print(self.message)
+        # Print score only when a capture just happened
+        if self.blue_team_flag_capture or self.red_team_flag_capture:
+            print(
+                f"Score - Blue: {self.game_score['blue_captures']}, "
+                f"Red: {self.game_score['red_captures']}"
+            )
 
         rewards = {agent_id: self.compute_rewards(agent_id) for agent_id in self.players}
         obs = {agent_id: self.state_to_obs(agent_id, self.normalize) for agent_id in raw_action_dict}

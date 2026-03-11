@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any
 import random
 import math
+import heapq
 
 # -----------------------------
 # Types / data structures
@@ -264,35 +265,60 @@ def block7_subgoal_dispatching(gs: GlobalState, hrl: HRLAction) -> None:
 
 
 # ==========================================================
-# BLOCK 8: LOW-LEVEL MULTI-AGENT RL EXECUTION (MAPPO/MASAC) -- SKIP FOR NOW
+# BLOCK 8: ASTAR
 # ==========================================================
-def block8_low_level_execution(
-    gs: GlobalState,
-    local_obs: List[LocalObservation],
-    hrl: HRLAction
-) -> List[Dict[str, Any]]:
-    """
-    Returns primitive action per robot (stub policy).
-    """
-    actions: List[Dict[str, Any]] = []
-    for obs in local_obs:
-        rid = obs.robot_id
-        team = gs.robots[rid].get("team")
-        sg = hrl.subgoals.get(team) if team else None
-
-        # If hazard locally seen, hold
-        if obs.hazards:
-            actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS["HOLD"], "message": "Hazard detected"})
-            continue
-
-        if sg is None:
-            actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS["E"], "message": "No subgoal"})
-            continue
-
-        primitive = pick_direction_from_vector(sg.vector)
-        actions.append({"robot_id": rid, "action": DISCRETE_ACTIONS[primitive], "message": f"Subgoal={sg.subgoal_id}"})
-
-    return actions
+def block8_astar(grid, start, goal):
+ 
+    rows = len(grid)
+    cols = len(grid[0])
+ 
+    def heuristic(a, b):
+        return abs(a[0]-b[0]) + abs(a[1]-b[1])
+ 
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+ 
+    came_from = {}
+ 
+    g_score = {start: 0}
+ 
+    while open_set:
+ 
+        current = heapq.heappop(open_set)[1]
+ 
+        if current == goal:
+            path = []
+            while current in came_from:
+                path.append(current)
+                current = came_from[current]
+            path.append(start)
+            return path[::-1]
+ 
+        neighbors = [
+            (current[0]+1,current[1]),
+            (current[0]-1,current[1]),
+            (current[0],current[1]+1),
+            (current[0],current[1]-1)
+        ]
+ 
+        for n in neighbors:
+ 
+            if 0 <= n[0] < rows and 0 <= n[1] < cols:
+ 
+                if grid[n[0]][n[1]] == 1:  # obstacle
+                    continue
+ 
+                tentative = g_score[current] + 1
+ 
+                if n not in g_score or tentative < g_score[n]:
+ 
+                    came_from[n] = current
+                    g_score[n] = tentative
+ 
+                    f = tentative + heuristic(n, goal)
+                    heapq.heappush(open_set, (f, n))
+ 
+    return []
 
 
 # ==========================================================

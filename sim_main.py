@@ -2,6 +2,7 @@ import sys
 import pygame
 from pyquaticus.envs.pyquaticus import PyQuaticusEnv
 from all_blocks import *
+import random
 
 def main():
     pygame.init()
@@ -11,11 +12,16 @@ def main():
     pos_choice = input(f"\nSelect starting position:\n" + 
                        "(1) Random\n" +
                        "(Any other key) Default - Straight line\n")
+    start_pos = "random" if pos_choice == "1" else "default"
+    
+    mode_choice = input(
+        "\nSelect mode:\n"
+        "(1) hard\n"
+        "(2) medium\n"
+        "(any other key) easy\n"
+    )
+    mode = "hard" if mode_choice == "1" else "medium" if mode_choice == "2" else "easy"
 
-    if pos_choice == '1':
-        start_pos = "random"
-    else:
-        start_pos = "default"
 
     env = PyQuaticusEnv(
         team_size=team_size,
@@ -68,27 +74,16 @@ def main():
             human_plan = block5_human_intervention(strategies, Config())
             hrl = block6_high_level_rl_manager(gs, human_plan)
             block7_subgoal_dispatching(gs, hrl)
-            robot_actions = block8_low_level_execution(gs, local_obs, hrl)
-
+            
+            # robot_actions = block8_low_level_execution(gs, local_obs, hrl) -- removed for now
+            robot_actions = [{"action": random.choice(list(DISCRETE_ACTIONS.keys()))} for _ in blue_agents]
             # Convert block actions → PyQuaticus discrete actions
             for i, agent in enumerate(blue_agents):
                 block_action = robot_actions[i]["action"]
-
-                if block_action == "MOVE_UP":
-                    actions[agent] = 0
-                elif block_action == "MOVE_RIGHT":
-                    actions[agent] = 1
-                elif block_action == "MOVE_DOWN":
-                    actions[agent] = 2
-                elif block_action == "MOVE_LEFT":
-                    actions[agent] = 3
-                elif block_action == "HOLD":
-                    actions[agent] = 4
-                else:
-                    actions[agent] = env.action_spaces[agent].sample()
+                actions[agent] = DISCRETE_ACTIONS.get(block_action, 8) 
 
             # Update block environment transition
-            block9_environment_transition(gs, robot_actions)
+            # block9_environment_transition(gs, robot_actions) -- removed for now
 
             # RED TEAM random movement logic
             for agent in red_agents:
