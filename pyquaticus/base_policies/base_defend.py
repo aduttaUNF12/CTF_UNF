@@ -198,6 +198,8 @@ class BaseDefender(BaseAgentPolicy):
             act_index = 12
             act_heading = self.angle180(self.vec_to_heading(ag_vect))
             closest_enemy = None
+            min_enemy_distance = 1000.00
+            enemy_dis_dict = {}
             for enem, pos in self.opp_team_pos_dict.items():
                 enemy_dis_dict[enem] = pos[0]
                 if pos[0] < min_enemy_distance and not my_obs[(enem, "is_tagged")]:
