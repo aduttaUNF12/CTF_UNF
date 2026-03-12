@@ -24,8 +24,8 @@ config_dict_std = {
     ),  # [0, 1] percentage of current speed (x or y) at which an agent is repelled from a wall (vertical or horizontal)
     "tau": (
         1 / 10
-    ),  # max dt (seconds) for updating the simulation
-    "sim_speedup_factor": 1, # simulation speed multiplier (integer >= 1)
+    ),  # dt (seconds) per simulation step; smaller = faster/finer steps
+    "sim_speedup_factor": 2,  # simulation speed multiplier (integer >= 1); 2 = 2x faster sim time per env.step()
     "max_time": 360.0,  # maximum time (seconds) per episode
     "max_score": 1,     # maximum score per episode (until a winner is declared)
     "max_screen_size": get_screen_res(),

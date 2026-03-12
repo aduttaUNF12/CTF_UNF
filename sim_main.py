@@ -1,6 +1,7 @@
 """
-Capture the Flag simulation using original pyquaticus rules.
-- Blue team: all_blocks pipeline (blocks 1–8) with A* low-level execution.
+Capture the Flag simulation (HRL + human-in-the-loop).
+- Blue team: all_blocks pipeline (blocks 1–8) with A* low-level execution; Block 10 triggers
+  replan (return to Human+LLM) when strategic change detected.
 - Red team: base_combined heuristic policy (attack/defend).
 - Action space: 9 discrete actions (8 directions + hold).
 """
@@ -20,6 +21,7 @@ from all_blocks import (
     block6_high_level_rl_manager,
     block7_subgoal_dispatching,
     block8_low_level_execution,
+    block10_check_strategic_changes,
 )
 
 # Wall avoidance: steer away when distance to any wall is below this (meters)
@@ -134,6 +136,11 @@ def main():
 
     paused = False
     clock = pygame.time.Clock()
+    # Prompt human once per episode (or when Block 10 requests replan); reuse plan otherwise
+    human_plan = None
+    step_count = 0
+    last_replan_step = -1
+    last_replan_ctf_state = None
 
     while True:
         for event in pygame.event.get():
@@ -153,19 +160,60 @@ def main():
             actions = {}
 
             gs = env.global_state
-            for i, agent_id in enumerate(blue_agents):
-                rid = f"R{i + 1}"
-                if rid in gs.robots:
-                    player = env.players[agent_id]
-                    gs.robots[rid]["position"] = (player.pos[0], player.pos[1])
-                    gs.robots[rid]["has_flag"] = player.has_flag
+            gs.t = step_count  # for Block 10 (check strategic changes / replan)
+            # Restrict gs.robots to blue agents only so strategy (Defend/Attack) applies only to blue
+            blue_rids = [f"R{i + 1}" for i in range(len(blue_agents))]
+            gs.robots = {
+                rid: {
+                    "position": (env.players[blue_agents[i]].pos[0], env.players[blue_agents[i]].pos[1]),
+                    "has_flag": env.players[blue_agents[i]].has_flag,
+                    "hp": gs.robots.get(rid, {}).get("hp", 100),
+                }
+                for i, rid in enumerate(blue_rids)
+            }
 
             local_obs = block2_state_collection(gs)
             gs = block3_global_state_encoding(gs, local_obs)
-            _, strategies = block4_llm_state_summarization(gs, Config())
-            human_plan = block5_human_intervention(strategies, Config())
+            # CTF state for Block 4 and Block 10 (replan checks)
+            ctf_state = {
+                "score_blue": env.game_score["blue_captures"],
+                "score_red": env.game_score["red_captures"],
+                "blue_has_red_flag": any(
+                    env.players[aid].has_flag for aid in blue_agents
+                ),
+                "red_has_blue_flag": any(
+                    env.players[aid].has_flag for aid in red_agents
+                ),
+            }
+            llm_summary, strategies = block4_llm_state_summarization(
+                gs, Config(), ctf_state=ctf_state
+            )
+            # Human approves strategy once per episode (or when replan triggered)
+            if human_plan is None:
+                human_plan = block5_human_intervention(
+                    strategies, Config(), llm_summary=llm_summary
+                )
+                # Anchor this plan so Block 10 doesn't immediately treat it as "replan"
+                last_replan_step = step_count
+                last_replan_ctf_state = dict(ctf_state)
             hrl = block6_high_level_rl_manager(gs, human_plan)
             block7_subgoal_dispatching(gs, hrl)
+            # Show strategy assignment when we just got a new plan (so user can verify)
+            if human_plan is not None and last_replan_step == step_count:
+                def_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Defend"]
+                atk_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Attack"]
+                print(f"Strategy applied — Defend (→blue zone): {def_rids}; Attack (→red zone): {atk_rids}")
+            # If replan needed, clear plan so next step will re-prompt
+            should_replan = block10_check_strategic_changes(
+                gs,
+                ctf_state=ctf_state,
+                last_replan_step=last_replan_step,
+                last_replan_ctf_state=last_replan_ctf_state,
+            ) or hrl.request_replan
+            if should_replan:
+                human_plan = None
+                last_replan_step = step_count
+                last_replan_ctf_state = dict(ctf_state)
             # A* goals: red zone center (attack) and blue zone center (return with flag)
             red_zone_center = env.flags[int(Team.RED_TEAM)].home
             blue_zone_center = env.flags[int(Team.BLUE_TEAM)].home
@@ -203,6 +251,7 @@ def main():
                 actions[agent_id] = 8 if act_17 == 16 else act_17 % 8
 
             obs, _, _, _, _ = env.step(actions)
+            step_count += 1
 
         env.render()
         clock.tick(30)

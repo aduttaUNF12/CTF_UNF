@@ -58,12 +58,14 @@ class HumanPlan:
     safety_constraints: List[str]
     mission_goals: List[str]
     approved_strategies: List[str]
+    strategy_index: Optional[int] = None  # 1, 2, or 3 when user picks a candidate; None for custom text
 
 @dataclass
 class Subgoal:
     subgoal_id: str
     description: str
     vector: List[float]  # placeholder embedding/encoding
+    role: str = "attack"  # "attack" | "defend" | "hold" — used by block8 for CTF goal
 
 @dataclass
 class HRLAction:
@@ -137,7 +139,7 @@ def _path_step_to_direction(dr: int, dc: int) -> str:
 # ==========================================================
 def block1_environment_initialization(cfg: Config) -> GlobalState:
     """
-    Loads environment, spawns N robots, resets map, initializes buffers/logging.
+    Load environment; spawn N robots; reset map, goals, flags; init buffers/logging.
     """
     if cfg.seed is not None:
         random.seed(cfg.seed)
@@ -166,7 +168,8 @@ def block1_environment_initialization(cfg: Config) -> GlobalState:
 # ==========================================================
 def block2_state_collection(gs: GlobalState) -> List[LocalObservation]:
     """
-    Each robot collects partial local observation (nearby objects, hazards).
+    Each robot Ri collects local observation oi: nearby map/objects/enemies, teammate positions,
+    local hazards. No full observability; all observations gathered centrally.
     """
     ids = list(gs.robots.keys())
 
@@ -195,64 +198,161 @@ def block2_state_collection(gs: GlobalState) -> List[LocalObservation]:
 # ==========================================================
 def block3_global_state_encoding(gs: GlobalState, local_obs: List[LocalObservation]) -> GlobalState:
     """
-    Combines local observations into a centralized global representation.
+    Combines all robot observations into global representation S_t.
+    Includes: robot states 1..N, environment map summary, historical actions & rewards,
+    previous human constraints, previous LLM suggestions. Used as input for strategy generation.
     """
     hazard_count = sum(len(o.hazards) for o in local_obs)
     enemy_signals = sum(1 for o in local_obs if "enemy?" in o.nearby)
-
-    gs.map_summary = f"{gs.map_summary} | hazards_seen={hazard_count} | enemy_signals={enemy_signals}"
+    n_act = len(gs.history["actions"])
+    n_rew = len(gs.history["rewards"])
+    n_hc = len(gs.history["human_constraints"])
+    n_llm = len(gs.history["llm_summaries"])
+    # Single snapshot for this step (do not append to previous; avoids unbounded "history of summaries")
+    gs.map_summary = (
+        f"Step t={gs.t}. Hazards reported={hazard_count}, enemy_signals={enemy_signals}. "
+        f"History: {n_act} actions, {n_rew} rewards, {n_hc} human_constraints, {n_llm} LLM summaries."
+    )
     return gs
 
 
 # ==========================================================
-# BLOCK 4: LLM STATE SUMMARIZATION
+# BLOCK 4: LLM STATE SUMMARIZATION (framework §4)
 # ==========================================================
-def block4_llm_state_summarization(gs: GlobalState, cfg: Config) -> Tuple[str, List[StrategyCandidate]]:
+def block4_llm_state_summarization(
+    gs: GlobalState, cfg: Config,
+    ctf_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[StrategyCandidate]]:
     """
-    Produces natural-language summary and candidate strategies (stub for real LLM).
+    Convert global encoded state S_t into natural-language summary; produce candidate
+    strategies with reasoning; generate uncertainties, warnings, risk predictions (framework §4).
     """
     if not cfg.enable_llm:
         return "", []
 
-    robot_count = len(gs.robots)
-    llm_summary = f"t={gs.t}. Robots active={robot_count}. Map: {gs.map_summary}"
+    # Assume blue side = high x (x >= 60), red side = low x (x < 60); 120x60 world
+    SCRIMMAGE_X = 60.0
+    ids = list(gs.robots.keys())
+    n_blue = len(ids) // 2
+    blue_ids = ids[:n_blue]
+    # Positions and roles from gs.robots (blue agents only for "our" summary)
+    on_our_side = []
+    on_their_side = []
+    carriers = []
+    for rid in blue_ids:
+        data = gs.robots.get(rid, {})
+        pos = data.get("position", (0, 0))
+        x = pos[0] if isinstance(pos, (tuple, list)) else pos[0]
+        if data.get("has_flag"):
+            carriers.append(rid)
+        if x >= SCRIMMAGE_X:
+            on_our_side.append(rid)
+        else:
+            on_their_side.append(rid)
 
+    sb = ctf_state.get("score_blue", 0) if ctf_state else 0
+    sr = ctf_state.get("score_red", 0) if ctf_state else 0
+    red_has_blue = ctf_state.get("red_has_blue_flag", False) if ctf_state else False
+    blue_has_red = ctf_state.get("blue_has_red_flag", False) if ctf_state else False
+
+    # Natural-language summary: "Frontline weak, enemies in sector B, robots 1-5 congested…"
+    summary_parts = []
+    summary_parts.append(f"Step t={gs.t}. Score Blue {sb} – Red {sr}.")
+    if len(on_their_side) > len(on_our_side):
+        summary_parts.append("Frontline weak: more of our robots on their side than holding ours.")
+    elif len(on_our_side) >= n_blue - 1:
+        summary_parts.append("Most of our team on our side; consider pushing into their sector.")
+    if carriers:
+        summary_parts.append(f"Carriers {', '.join(carriers)} returning with flag.")
+    if red_has_blue:
+        summary_parts.append("Threat: Red has our flag; defend and reclaim.")
+    if blue_has_red and not carriers:
+        summary_parts.append("We have their flag (carrier not in list—check state).")
+    if len(on_their_side) >= 2 and len([r for r in on_their_side if r not in carriers]) >= 2:
+        summary_parts.append("Multiple attackers in enemy sector.")
+    # Congestion: many in similar area (simplified: count on each side)
+    if n_blue >= 4 and len(on_our_side) >= 3:
+        summary_parts.append("Robots on our side somewhat congested; could spread or send more to attack.")
+    summary_parts.append(gs.map_summary)
+
+    llm_summary = " ".join(summary_parts)
+    gs.history["llm_summaries"].append(llm_summary)
+
+    # Candidate strategies with reasoning (framework style)
     strategies = [
         StrategyCandidate(
-            text="Team A defend; Team B flank right; Team C explore north.",
-            risks=["Possible hazard exposure", "Higher communication overhead"],
-            uncertainties=["Enemy locations partially observed", "Objective location unknown"]
+            text="Team A defend sector D (our flag); Team B flank right; Team C push northern side toward red flag.",
+            risks=["Defenders may be outnumbered if Red commits", "Flank could be cut off"],
+            uncertainties=["Enemy strength in sector B unknown", "Red flag guard count unknown"],
         ),
         StrategyCandidate(
-            text="Scout corners with 2 robots; others hold and communicate.",
-            risks=["Scouts could isolate", "Defense might weaken"],
-            uncertainties=["Obstacle density unknown"]
-        )
+            text="Team A defend our flag; Team B and C all attack red zone—overwhelm their defense.",
+            risks=["Our flag undefended", "Red may score if they have our flag"],
+            uncertainties=["How many Red are attacking vs defending"],
+        ),
+        StrategyCandidate(
+            text="Team A hold and defend; Team B scout northern corridor; Team C scout southern corridor, then regroup.",
+            risks=["Slower to capture", "Red may score first if they have our flag"],
+            uncertainties=["When to switch from scout to full attack"],
+        ),
     ]
 
-    gs.history["llm_summaries"].append(llm_summary)
     return llm_summary, strategies
 
 
 # ==========================================================
 # BLOCK 5: HUMAN STRATEGY INTERVENTION
 # ==========================================================
-def block5_human_intervention(strategies: List[StrategyCandidate], cfg: Config) -> HumanPlan:
+def block5_human_intervention(
+    strategies: List[StrategyCandidate], cfg: Config,
+    llm_summary: str = "",
+) -> HumanPlan:
     """
-    Human approves/modifies strategies and adds constraints.
-    (Stub: auto-approves first strategy + adds safety constraint.)
+    Human reads LLM summary; approves, modifies, merges, or rejects strategies; adds priorities,
+    safety constraints, mission goals. Output = final HUMAN+LLM strategic plan.
+    Caller should invoke once per episode (or when replanning) and reuse the returned plan.
     """
     if not cfg.enable_human_intervention:
-        return HumanPlan([], [], [], [])
+        return HumanPlan([], [], [], [], None)
 
-    approved = strategies[0].text if strategies else "No strategy available"
-    plan = HumanPlan(
+    if not strategies:
+        return HumanPlan(
+            priorities=[], safety_constraints=[], mission_goals=[],
+            approved_strategies=["No strategy available"],
+            strategy_index=None,
+        )
+
+    print("\n--- Blue team: strategy approval ---")
+    print("Summary:", llm_summary)
+    print("\nCandidate strategies (with risks and uncertainties):")
+    for i, s in enumerate(strategies, 1):
+        print(f"  {i}. {s.text}")
+        if s.risks:
+            print(f"     Risks: {', '.join(s.risks)}")
+        if s.uncertainties:
+            print(f"     Uncertainties: {', '.join(s.uncertainties)}")
+    print("\nChoose a strategy (1–3), or type your own (e.g. 'Two defend, rest attack'):")
+    choice = input("Your choice [1]: ").strip() or "1"
+
+    strategy_index = None
+    if choice.isdigit() and 1 <= int(choice) <= len(strategies):
+        strategy_index = int(choice)
+        approved = strategies[strategy_index - 1].text
+    else:
+        approved = choice if choice else strategies[0].text
+
+    constraints = input("Extra safety constraints (comma-separated, or Enter for none): ").strip()
+    safety_constraints = ["Avoid red_zone"]
+    if constraints:
+        safety_constraints.extend(c.strip() for c in constraints.split(",") if c.strip())
+
+    return HumanPlan(
         priorities=["Defense > Capture"],
-        safety_constraints=["Avoid red_zone"],
-        mission_goals=["Secure perimeter", "Locate objective"],
-        approved_strategies=[approved]
+        safety_constraints=safety_constraints,
+        mission_goals=["Secure perimeter", "Capture opponent flag"],
+        approved_strategies=[approved],
+        strategy_index=strategy_index,
     )
-    return plan
 
 
 # ==========================================================
@@ -260,22 +360,52 @@ def block5_human_intervention(strategies: List[StrategyCandidate], cfg: Config) 
 # ==========================================================
 def block6_high_level_rl_manager(gs: GlobalState, human_plan: HumanPlan) -> HRLAction:
     """
-    Decides teams, assigns subgoals, sets replan requests (stub heuristic).
+    HRL meta-policy: inputs = Human+LLM plan, encoded global state S_t.
+    Decides: (A) which robot groups/teams to form; (B) which subgoals to assign (e.g. hold region,
+    capture flag, patrol, scout); (C) when to replan. Output = subgoal assignment a_HRL.
+    Maps approved strategy text to Defend/Attack teams and role-based subgoals for block8.
     """
     ids = list(gs.robots.keys())
-    teams: Dict[TeamId, List[RobotId]] = {
-        "A": [rid for i, rid in enumerate(ids) if i % 3 == 0],
-        "B": [rid for i, rid in enumerate(ids) if i % 3 == 1],
-        "C": [rid for i, rid in enumerate(ids) if i % 3 == 2],
-    }
+    if not ids:
+        return HRLAction(teams={}, subgoals={}, request_replan=False)
 
-    subgoals: Dict[TeamId, Subgoal] = {
-        "A": Subgoal("hold_r1", "Hold region R1 (defense)", encode_subgoal("Hold region R1")),
-        "B": Subgoal("flank_right", "Flank right corridor", encode_subgoal("Flank right corridor")),
-        "C": Subgoal("scout_north", "Scout unexplored north", encode_subgoal("Scout north")),
-    }
+    approved = (human_plan.approved_strategies or [""])[0].lower()
+    n = len(ids)
 
-    # Example: could request replan if hazards are high (stub logic)
+    # When user picked strategy 1/2/3, use that to set defender count (so teams differ by choice)
+    idx = getattr(human_plan, "strategy_index", None)
+    if idx is not None and 1 <= idx <= 3:
+        # 1 = balanced (2 defend), 2 = aggressive (1 defend), 3 = cautious (3 defend)
+        num_defend = {1: min(2, n), 2: min(1, n), 3: min(3, max(1, n - 1))}[idx]
+    else:
+        # Parse custom text into roles: how many defenders (rest attackers)
+        num_defend = 0
+        if "split" in approved or "1–2 defenders" in approved or "1-2 defenders" in approved:
+            num_defend = min(2, max(1, n // 3))
+        elif "team a defend" in approved or ("defend" in approved and ("flank" in approved or "push" in approved or "attack" in approved or "scout" in approved)):
+            num_defend = min(2, max(1, n // 3))
+        elif "defend first" in approved or "majority defend" in approved:
+            num_defend = max(1, n - 2)
+        if "defend" in approved and num_defend == 0 and n >= 2:
+            num_defend = min(2, max(1, n // 3))
+
+    defend_ids = ids[:num_defend]
+    attack_ids = ids[num_defend:]
+
+    teams: Dict[TeamId, List[RobotId]] = {}
+    subgoals: Dict[TeamId, Subgoal] = {}
+
+    if defend_ids:
+        teams["Defend"] = defend_ids
+        subgoals["Defend"] = Subgoal(
+            "defend_flag", "Defend our flag", encode_subgoal("Defend our flag"), role="defend"
+        )
+    if attack_ids:
+        teams["Attack"] = attack_ids
+        subgoals["Attack"] = Subgoal(
+            "attack_red", "Go to red zone / capture flag", encode_subgoal("Attack red zone"), role="attack"
+        )
+
     request_replan = False
     return HRLAction(teams=teams, subgoals=subgoals, request_replan=request_replan)
 
@@ -285,7 +415,8 @@ def block6_high_level_rl_manager(gs: GlobalState, human_plan: HumanPlan) -> HRLA
 # ==========================================================
 def block7_subgoal_dispatching(gs: GlobalState, hrl: HRLAction) -> None:
     """
-    Attaches team id to each robot so low-level knows which subgoal applies.
+    Subgoal g_k assigned to team Tk; each subgoal encoded into vector; each robot receives
+    its team's subgoal with local meaning.
     """
     for team_id, members in hrl.teams.items():
         for rid in members:
@@ -374,7 +505,7 @@ def _build_grid(
 
 
 # ==========================================================
-# BLOCK 8: LOW-LEVEL EXECUTION (A* pathfinding -> discrete action per robot)
+# BLOCK 8: LOW-LEVEL MULTI-AGENT EXECUTION 
 # ==========================================================
 def block8_low_level_execution(
     gs: GlobalState, local_obs: List[LocalObservation], hrl: HRLAction,
@@ -383,13 +514,10 @@ def block8_low_level_execution(
     own_flag_world: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Uses A* to plan a path toward a goal for each robot, then returns the first
-    step direction (W, NW, N, NE, E, SE, S, SW, or HOLD).
-    If opponent_flag_world (x, y) is provided, blue agents path toward that
-    position (CTF: go to opponent's flag / red zone). If own_flag_world is also
-    provided and gs.robots[rid]["has_flag"] is True, that agent paths toward
-    own_flag_world (return home to score). Otherwise uses subgoal-derived offset.
-    Boundary buffer (2 cells) keeps paths inside play area to avoid OOB teleport.
+    Each robot Ri uses policy (here A* placeholder for MAPPO/MASAC) to select primitive action
+    (movement). Inputs: local obs oi, encoded subgoal g_k. Outputs: action ai.
+    CTF: carrier → own zone; role defend → own zone; role attack → opponent zone. Boundary buffer
+    keeps paths inside play area.
     """
     use_flag_goal = opponent_flag_world is not None
     # boundary_buffer = agent radius in cells so agents can get as close to walls as allowed
@@ -412,12 +540,14 @@ def block8_low_level_execution(
         start = _world_to_grid(x, y)
 
         if use_flag_goal:
-            # If agent has flag, path to own home zone; else path to opponent zone
+            # Carrier always goes home; Defend team → own zone, Attack team → opponent zone (use team_id explicitly)
             if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
+                goal_world = own_flag_world
+            elif team_id == "Defend" and own_flag_world is not None:
                 goal_world = own_flag_world
             else:
                 goal_world = opponent_flag_world
-            goal = _world_to_grid(goal_world[0], goal_world[1])
+            goal = _world_to_grid(float(goal_world[0]), float(goal_world[1]))
         else:
             drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
             goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
@@ -458,11 +588,13 @@ def block8_low_level_execution(
 
 
 # ==========================================================
-# BLOCK 9: ENVIRONMENT TRANSITION -- SKIP FOR NOW
+# BLOCK 9: ENVIRONMENT TRANSITION
 # ==========================================================
 def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]) -> Reward:
     """
-    Applies actions -> updates positions -> computes reward -> updates history.
+    Apply all robot actions; world → S_(t+1). Compute reward (task progress, goal completion,
+    damage/collisions, safety violations); update logs. Standalone use; sim_main
+    uses PyQuaticus env for transition.
     """
     reward_val = 0.0
     breakdown: List[str] = []
@@ -500,14 +632,55 @@ def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]
     return Reward(value=reward_val, breakdown=breakdown)
 
 
+# Replan every this many env steps (set 0 to disable periodic replan)
+REPLAN_INTERVAL_STEPS = 60
+
 # ==========================================================
 # BLOCK 10: CHECK FOR STRATEGIC CHANGES
 # ==========================================================
-def block10_check_strategic_changes(gs: GlobalState) -> bool:
+def block10_check_strategic_changes(
+    gs: GlobalState,
+    ctf_state: Optional[Dict[str, Any]] = None,
+    last_replan_step: int = -1,
+    last_replan_ctf_state: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
-    Determines if replanning is needed (periodic stub).
+    Returns True if we should return to Human+LLM (steps 4–5). Caller should set human_plan = None.
+
+    Checks:
+    1) Periodic: (gs.t - last_replan_step) >= REPLAN_INTERVAL_STEPS (if REPLAN_INTERVAL_STEPS > 0).
+    2) Plan failing: score_red increased since last replan (they just scored).
+    3) New threat: red_has_blue_flag just became True since last replan.
+
+    ctf_state: score_blue, score_red, blue_has_red_flag, red_has_blue_flag.
+    Caller must pass last_replan_step and last_replan_ctf_state and update them when this returns True.
     """
-    return gs.t > 0 and (gs.t % 10 == 0)
+    if ctf_state is None:
+        ctf_state = {}
+    step = gs.t
+    sr = ctf_state.get("score_red", 0)
+    red_has_blue = ctf_state.get("red_has_blue_flag", False)
+
+    # 1) Periodic replan
+    if REPLAN_INTERVAL_STEPS > 0 and step > 0 and last_replan_step >= 0 and (step - last_replan_step) >= REPLAN_INTERVAL_STEPS:
+        return True
+
+    # 2) Plan failing: they just scored since last replan
+    if last_replan_ctf_state is not None:
+        prev_sr = last_replan_ctf_state.get("score_red", -1)
+        if sr > prev_sr:
+            return True
+        prev_red_had = last_replan_ctf_state.get("red_has_blue_flag", False)
+        if red_has_blue and not prev_red_had:
+            return True  # they just took our flag (new threat; see also check 3)
+
+    # 3) New threat: red just took our flag since last replan
+    if red_has_blue and last_replan_step >= 0 and last_replan_ctf_state is not None:
+        prev_red_had = last_replan_ctf_state.get("red_has_blue_flag", False)
+        if not prev_red_had:
+            return True
+
+    return False
 
 
 # ==========================================================
@@ -515,7 +688,7 @@ def block10_check_strategic_changes(gs: GlobalState) -> bool:
 # ==========================================================
 def block11_learning_and_updates(gs: GlobalState) -> None:
     """
-    Placeholder for PPO/A2C updates (high-level) and MAPPO/MASAC updates (low-level).
+     Placeholder for PPO/A2C updates (high-level) and MAPPO/MASAC updates (low-level).
     """
     # In a real implementation:
     # - collect trajectories
@@ -530,7 +703,7 @@ def block11_learning_and_updates(gs: GlobalState) -> None:
 # ==========================================================
 def block12_termination_check(gs: GlobalState, cfg: Config) -> bool:
     """
-    Checks episode termination conditions.
+    Win/loss achieved? Task finished? Human manually ends episode?.
     """
     return gs.t >= cfg.max_steps_per_episode
 
