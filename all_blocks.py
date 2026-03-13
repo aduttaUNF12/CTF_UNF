@@ -4,6 +4,13 @@ from typing import Dict, List, Tuple, Optional, Any
 import random
 import math
 import heapq
+import os
+import json
+
+try:
+    import openai  # type: ignore[import]
+except Exception:  # pragma: no cover - optional dependency
+    openai = None
 
 # -----------------------------
 # Types / data structures
@@ -81,7 +88,7 @@ class Reward:
 @dataclass
 class Config:
     num_robots: int = 12
-    max_steps_per_episode: int = 50
+    max_steps_per_episode: int = 5000
     enable_llm: bool = True
     enable_human_intervention: bool = True
     log_every: int = 5
@@ -111,8 +118,9 @@ def pick_direction_from_vector(v: List[float]) -> str:
 GRID_ROWS = 60
 GRID_COLS = 120
 # Boundary buffer in grid cells: keep paths at least this many cells from walls.
-# Set to agent_radius (2) so agents can get as close to boundaries as the env allows.
-AGENT_RADIUS_CELLS = 2
+# Use 6 so defenders (and all agents) don't path along the bottom/top and hit walls (agent radius 2m).
+PATH_BOUNDARY_BUFFER_CELLS = 6
+AGENT_RADIUS_CELLS = 2  # kept for any other use; grid uses PATH_BOUNDARY_BUFFER_CELLS
 
 # (drow, dcol) for 8 directions: N, NE, E, SE, S, SW, W, NW
 _DIRECTION_TO_OFFSET = {
@@ -130,8 +138,11 @@ def _world_to_grid(x: float, y: float) -> Tuple[int, int]:
 
 
 def _path_step_to_direction(dr: int, dc: int) -> str:
-    """Map (drow, dcol) from one path cell to next to direction string."""
-    return _OFFSET_TO_DIRECTION.get((dr, dc), "HOLD")
+    """Map (drow, dcol) from one path cell to next to direction string.
+    Grid has row=y; pyquaticus uses heading 0 (N) = +y. So we flip dr so that
+    increasing row (dr=1 = +y) maps to N (env +y), not S (env -y which sent defenders to bottom).
+    """
+    return _OFFSET_TO_DIRECTION.get((-dr, dc), "HOLD")
 
 
 # ==========================================================
@@ -163,23 +174,61 @@ def block1_environment_initialization(cfg: Config) -> GlobalState:
     return gs
 
 
-# ==========================================================
-# BLOCK 2: STATE COLLECTION (RAW MULTI-ROBOT OBSERVATIONS)
-# ==========================================================
-def block2_state_collection(gs: GlobalState) -> List[LocalObservation]:
+# Thresholds for env-driven nearby/hazards (meters). PyQuaticus obs: wall_*_distance, (opponent_i, "distance").
+WALL_NEAR_M = 20.0
+WALL_HAZARD_M = 8.0
+ENEMY_SPOTTED_M = 40.0
+
+
+def block2_state_collection(
+    gs: GlobalState,
+    env_obs: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[LocalObservation]:
     """
     Each robot Ri collects local observation oi: nearby map/objects/enemies, teammate positions,
     local hazards. No full observability; all observations gathered centrally.
+    If env_obs is provided (agent_id -> raw obs dict from env.state_to_obs(agent_id, normalize=False)),
+    nearby and hazards are derived from env: walls (wall_*_distance), enemies (opponent_* distance),
+    and red_zone when on_side is False (on enemy territory).
     """
     ids = list(gs.robots.keys())
 
     local_obs: List[LocalObservation] = []
     for rid in ids:
         pos = gs.robots[rid]["position"]
-
         teammates = [(tid, gs.robots[tid]["position"]) for tid in ids if tid != rid][:3]
-        nearby = [x for x in ["wall", "crate", "enemy?"] if random.random() < 0.4]
-        hazards = [x for x in ["red_zone", "minefield"] if random.random() < 0.2]
+
+        nearby: List[str] = []
+        hazards: List[str] = []
+        if env_obs is not None:
+            agent_id: Optional[int] = None
+            if rid.startswith("R") and rid[1:].isdigit():
+                agent_id = int(rid[1:])
+            if agent_id is not None and agent_id in env_obs:
+                obs = env_obs[agent_id]
+                wall_near_any = False
+                wall_hazard_any = False
+                for i in range(4):
+                    d = obs.get(f"wall_{i}_distance", 1e9)
+                    if isinstance(d, (int, float)):
+                        if d < WALL_HAZARD_M:
+                            wall_hazard_any = True
+                        if d < WALL_NEAR_M:
+                            wall_near_any = True
+                if wall_hazard_any:
+                    hazards.append("wall_close")
+                if wall_near_any:
+                    nearby.append("wall_near")
+                for i in range(6):
+                    d = obs.get((f"opponent_{i}", "distance"), 1e9)
+                    if isinstance(d, (int, float)) and d < ENEMY_SPOTTED_M:
+                        nearby.append("enemy_spotted")
+                        break
+                if not obs.get("on_side", True):
+                    hazards.append("red_zone")
+        if not nearby and not hazards:
+            nearby = [x for x in ["wall", "crate", "enemy?"] if random.random() < 0.4]
+            hazards = [x for x in ["red_zone", "minefield"] if random.random() < 0.2]
 
         local_obs.append(LocalObservation(
             robot_id=rid,
@@ -187,7 +236,7 @@ def block2_state_collection(gs: GlobalState) -> List[LocalObservation]:
             nearby=nearby,
             teammates=teammates,
             hazards=hazards,
-            messages_in=[]
+            messages_in=[],
         ))
 
     return local_obs
@@ -203,7 +252,7 @@ def block3_global_state_encoding(gs: GlobalState, local_obs: List[LocalObservati
     previous human constraints, previous LLM suggestions. Used as input for strategy generation.
     """
     hazard_count = sum(len(o.hazards) for o in local_obs)
-    enemy_signals = sum(1 for o in local_obs if "enemy?" in o.nearby)
+    enemy_signals = sum(1 for o in local_obs if "enemy_spotted" in o.nearby or "enemy?" in o.nearby)
     n_act = len(gs.history["actions"])
     n_rew = len(gs.history["rewards"])
     n_hc = len(gs.history["human_constraints"])
@@ -225,24 +274,23 @@ def block4_llm_state_summarization(
 ) -> Tuple[str, List[StrategyCandidate]]:
     """
     Convert global encoded state S_t into natural-language summary; produce candidate
-    strategies with reasoning; generate uncertainties, warnings, risk predictions (framework §4).
+    strategies with reasoning; generate uncertainties, warnings, risk predictions.
+    If an external LLM is available (OPENAI_API_KEY and openai installed), use it to
+    generate the summary and strategies. Otherwise fall back to rule-based stubs.
     """
-    if not cfg.enable_llm:
-        return "", []
-
     # Assume blue side = high x (x >= 60), red side = low x (x < 60); 120x60 world
     SCRIMMAGE_X = 60.0
     ids = list(gs.robots.keys())
-    n_blue = len(ids) // 2
+    n_blue = max(1, len(ids)) // 2
     blue_ids = ids[:n_blue]
     # Positions and roles from gs.robots (blue agents only for "our" summary)
-    on_our_side = []
-    on_their_side = []
-    carriers = []
+    on_our_side: List[RobotId] = []
+    on_their_side: List[RobotId] = []
+    carriers: List[RobotId] = []
     for rid in blue_ids:
         data = gs.robots.get(rid, {})
-        pos = data.get("position", (0, 0))
-        x = pos[0] if isinstance(pos, (tuple, list)) else pos[0]
+        pos = data.get("position", (0.0, 0.0))
+        x = float(pos[0])
         if data.get("has_flag"):
             carriers.append(rid)
         if x >= SCRIMMAGE_X:
@@ -255,8 +303,8 @@ def block4_llm_state_summarization(
     red_has_blue = ctf_state.get("red_has_blue_flag", False) if ctf_state else False
     blue_has_red = ctf_state.get("blue_has_red_flag", False) if ctf_state else False
 
-    # Natural-language summary: "Frontline weak, enemies in sector B, robots 1-5 congested…"
-    summary_parts = []
+    # Rule-based natural-language summary as a fallback / context for the LLM
+    summary_parts: List[str] = []
     summary_parts.append(f"Step t={gs.t}. Score Blue {sb} – Red {sr}.")
     if len(on_their_side) > len(on_our_side):
         summary_parts.append("Frontline weak: more of our robots on their side than holding ours.")
@@ -270,34 +318,136 @@ def block4_llm_state_summarization(
         summary_parts.append("We have their flag (carrier not in list—check state).")
     if len(on_their_side) >= 2 and len([r for r in on_their_side if r not in carriers]) >= 2:
         summary_parts.append("Multiple attackers in enemy sector.")
-    # Congestion: many in similar area (simplified: count on each side)
     if n_blue >= 4 and len(on_our_side) >= 3:
         summary_parts.append("Robots on our side somewhat congested; could spread or send more to attack.")
     summary_parts.append(gs.map_summary)
 
-    llm_summary = " ".join(summary_parts)
-    gs.history["llm_summaries"].append(llm_summary)
+    rule_based_summary = " ".join(summary_parts)
 
-    # Candidate strategies with reasoning (framework style)
-    strategies = [
-        StrategyCandidate(
-            text="Team A defend sector D (our flag); Team B flank right; Team C push northern side toward red flag.",
-            risks=["Defenders may be outnumbered if Red commits", "Flank could be cut off"],
-            uncertainties=["Enemy strength in sector B unknown", "Red flag guard count unknown"],
-        ),
-        StrategyCandidate(
-            text="Team A defend our flag; Team B and C all attack red zone—overwhelm their defense.",
-            risks=["Our flag undefended", "Red may score if they have our flag"],
-            uncertainties=["How many Red are attacking vs defending"],
-        ),
-        StrategyCandidate(
-            text="Team A hold and defend; Team B scout northern corridor; Team C scout southern corridor, then regroup.",
-            risks=["Slower to capture", "Red may score first if they have our flag"],
-            uncertainties=["When to switch from scout to full attack"],
-        ),
-    ]
+    # Default stub strategies (used if LLM is disabled or unavailable)
+    def _stub_strategies() -> Tuple[str, List[StrategyCandidate]]:
+        strategies = [
+            StrategyCandidate(
+                text="Team A defend; Team B flank right; Team C explore north.",
+                risks=["Possible hazard exposure", "Higher communication overhead"],
+                uncertainties=["Enemy locations partially observed", "Objective location unknown"],
+            ),
+            StrategyCandidate(
+                text="Scout corners with 2 robots; others hold and communicate.",
+                risks=["Scouts could isolate", "Defense might weaken"],
+                uncertainties=["Obstacle density unknown"],
+            ),
+        ]
+        return rule_based_summary, strategies
 
-    return llm_summary, strategies
+    # If LLM is disabled, just use the stub logic
+    if not cfg.enable_llm:
+        llm_summary, strategies = _stub_strategies()
+        gs.history["llm_summaries"].append(llm_summary)
+        return llm_summary, strategies
+
+    # Try to call external LLM (OpenAI) if configured; otherwise fall back to stub
+    api_key = os.getenv("OPENAI_API_KEY")
+    if openai is None:
+        llm_summary, strategies = _stub_strategies()
+        gs.history["llm_summaries"].append(llm_summary)
+        print("[Block 4] Using stub strategies (openai package not installed).")
+        return llm_summary, strategies
+    if not api_key:
+        llm_summary, strategies = _stub_strategies()
+        gs.history["llm_summaries"].append(llm_summary)
+        print("[Block 4] Using stub strategies (OPENAI_API_KEY not set).")
+        return llm_summary, strategies
+
+    # Build a compact machine-readable state description for the LLM
+    state_payload = {
+        "time_step": gs.t,
+        "score": {"blue": sb, "red": sr},
+        "blue_has_red_flag": bool(blue_has_red),
+        "red_has_blue_flag": bool(red_has_blue),
+        "blue_robots_on_our_side": on_our_side,
+        "blue_robots_on_their_side": on_their_side,
+        "carriers": carriers,
+        "rule_based_summary": rule_based_summary,
+    }
+
+    system_msg = (
+        "You are the high-level strategist for the BLUE team in a capture-the-flag "
+        "simulation. Propose 2 or 3 concise strategies for the BLUE team, each with "
+        "risks and uncertainties, given the current game state. Respond with valid JSON only."
+    )
+    user_msg = (
+        "Game state JSON:\n"
+        + json.dumps(state_payload, sort_keys=True)
+        + "\n\n"
+        "Respond ONLY with valid JSON in this exact form (no markdown, no code fences):\n"
+        "{\"summary\": \"one paragraph summary\", \"strategies\": [{\"text\": \"...\", \"risks\": [\"...\"], \"uncertainties\": [\"...\"]}, ...]}\n"
+    )
+
+    def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
+        """Parse JSON from LLM response, stripping optional markdown code fences."""
+        s = raw.strip()
+        if s.startswith("```"):
+            # Remove ```json or ``` and trailing ```
+            lines = s.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            s = "\n".join(lines)
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return None
+
+    try:
+        client = openai.OpenAI(api_key=api_key)  # type: ignore[attr-defined]
+        completion = client.chat.completions.create(  # type: ignore[attr-defined]
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.7,
+            max_tokens=800,
+        )
+        msg = completion.choices[0].message
+        content = (msg.content or "").strip()
+        if not content:
+            raise ValueError("Empty LLM response")
+        parsed = _extract_json(content)
+        if not parsed or not isinstance(parsed.get("strategies"), list):
+            raise ValueError("LLM response missing 'strategies' array")
+        llm_summary = parsed.get("summary") or rule_based_summary
+        if isinstance(llm_summary, str):
+            pass
+        else:
+            llm_summary = rule_based_summary
+        strat_objs: List[StrategyCandidate] = []
+        for s in parsed["strategies"]:
+            if not isinstance(s, dict):
+                continue
+            text = s.get("text") or ""
+            if not text:
+                continue
+            strat_objs.append(
+                StrategyCandidate(
+                    text=text,
+                    risks=list(s.get("risks") or []) if isinstance(s.get("risks"), list) else [],
+                    uncertainties=list(s.get("uncertainties") or []) if isinstance(s.get("uncertainties"), list) else [],
+                )
+            )
+        if not strat_objs:
+            llm_summary, strat_objs = _stub_strategies()
+        gs.history["llm_summaries"].append(llm_summary)
+        print(f"[Block 4] LLM returned {len(strat_objs)} strategy(ies).")
+        return llm_summary, strat_objs
+    except Exception as e:
+        # Any API / parsing failure: fall back to stub strategies so the sim still runs
+        llm_summary, strategies = _stub_strategies()
+        gs.history["llm_summaries"].append(llm_summary)
+        print(f"[Block 4] LLM failed ({e!r}), using stub strategies.")
+        return llm_summary, strategies
 
 
 # ==========================================================
@@ -331,7 +481,7 @@ def block5_human_intervention(
             print(f"     Risks: {', '.join(s.risks)}")
         if s.uncertainties:
             print(f"     Uncertainties: {', '.join(s.uncertainties)}")
-    print("\nChoose a strategy (1–3), or type your own (e.g. 'Two defend, rest attack'):")
+    print(f"\nChoose a strategy (1–{len(strategies)}), or type your own (e.g. 'Two defend, rest attack'):")
     choice = input("Your choice [1]: ").strip() or "1"
 
     strategy_index = None
@@ -341,14 +491,9 @@ def block5_human_intervention(
     else:
         approved = choice if choice else strategies[0].text
 
-    constraints = input("Extra safety constraints (comma-separated, or Enter for none): ").strip()
-    safety_constraints = ["Avoid red_zone"]
-    if constraints:
-        safety_constraints.extend(c.strip() for c in constraints.split(",") if c.strip())
-
     return HumanPlan(
         priorities=["Defense > Capture"],
-        safety_constraints=safety_constraints,
+        safety_constraints=["Avoid red_zone"],
         mission_goals=["Secure perimeter", "Capture opponent flag"],
         approved_strategies=[approved],
         strategy_index=strategy_index,
@@ -372,25 +517,31 @@ def block6_high_level_rl_manager(gs: GlobalState, human_plan: HumanPlan) -> HRLA
     approved = (human_plan.approved_strategies or [""])[0].lower()
     n = len(ids)
 
-    # When user picked strategy 1/2/3, use that to set defender count (so teams differ by choice)
+    # When user picked strategy 1/2/3, use that to set team split. Strategy 1 = Defend + Flank + Attack.
     idx = getattr(human_plan, "strategy_index", None)
+    num_flank = 0
     if idx is not None and 1 <= idx <= 3:
-        # 1 = balanced (2 defend), 2 = aggressive (1 defend), 3 = cautious (3 defend)
+        # 1 = balanced with flank (2 defend, 2 flank, rest attack), 2 = aggressive (1 defend), 3 = cautious (3 defend)
         num_defend = {1: min(2, n), 2: min(1, n), 3: min(3, max(1, n - 1))}[idx]
+        if idx == 1 and n >= 4:
+            num_flank = min(2, n - num_defend - 1)  # at least 1 attacker
     else:
-        # Parse custom text into roles: how many defenders (rest attackers)
+        # Parse custom text
         num_defend = 0
         if "split" in approved or "1–2 defenders" in approved or "1-2 defenders" in approved:
             num_defend = min(2, max(1, n // 3))
         elif "team a defend" in approved or ("defend" in approved and ("flank" in approved or "push" in approved or "attack" in approved or "scout" in approved)):
             num_defend = min(2, max(1, n // 3))
+            if "flank" in approved and n >= 4:
+                num_flank = min(2, n - num_defend - 1)
         elif "defend first" in approved or "majority defend" in approved:
             num_defend = max(1, n - 2)
         if "defend" in approved and num_defend == 0 and n >= 2:
             num_defend = min(2, max(1, n // 3))
 
     defend_ids = ids[:num_defend]
-    attack_ids = ids[num_defend:]
+    flank_ids = ids[num_defend : num_defend + num_flank] if num_flank else []
+    attack_ids = ids[num_defend + num_flank :]
 
     teams: Dict[TeamId, List[RobotId]] = {}
     subgoals: Dict[TeamId, Subgoal] = {}
@@ -399,6 +550,11 @@ def block6_high_level_rl_manager(gs: GlobalState, human_plan: HumanPlan) -> HRLA
         teams["Defend"] = defend_ids
         subgoals["Defend"] = Subgoal(
             "defend_flag", "Defend our flag", encode_subgoal("Defend our flag"), role="defend"
+        )
+    if flank_ids:
+        teams["Flank"] = flank_ids
+        subgoals["Flank"] = Subgoal(
+            "flank_right", "Flank right toward enemy", encode_subgoal("Flank right"), role="flank"
         )
     if attack_ids:
         teams["Attack"] = attack_ids
@@ -512,16 +668,19 @@ def block8_low_level_execution(
     grid_rows: int = GRID_ROWS, grid_cols: int = GRID_COLS,
     opponent_flag_world: Optional[Tuple[float, float]] = None,
     own_flag_world: Optional[Tuple[float, float]] = None,
+    defender_hold_world: Optional[Tuple[float, float]] = None,
+    flank_hold_world: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Each robot Ri uses policy (here A* placeholder for MAPPO/MASAC) to select primitive action
     (movement). Inputs: local obs oi, encoded subgoal g_k. Outputs: action ai.
-    CTF: carrier → own zone; role defend → own zone; role attack → opponent zone. Boundary buffer
-    keeps paths inside play area.
+    CTF: carrier → own zone; Defend → defender_hold_world; Flank → flank_hold_world (flank right);
+    Attack → opponent zone. Boundary buffer keeps paths inside play area.
     """
     use_flag_goal = opponent_flag_world is not None
     # boundary_buffer = agent radius in cells so agents can get as close to walls as allowed
-    boundary_buffer = AGENT_RADIUS_CELLS if use_flag_goal else 0
+    # Keep paths well away from walls so defenders don't run into bottom/top boundaries
+    boundary_buffer = PATH_BOUNDARY_BUFFER_CELLS if use_flag_goal else 0
     grid = _build_grid(grid_rows, grid_cols, boundary_buffer=boundary_buffer)
     robot_actions: List[Dict[str, Any]] = []
     goal_offset_cells = 15
@@ -540,11 +699,13 @@ def block8_low_level_execution(
         start = _world_to_grid(x, y)
 
         if use_flag_goal:
-            # Carrier always goes home; Defend team → own zone, Attack team → opponent zone (use team_id explicitly)
+            # Carrier → own zone; Defend → defender_hold_world; Flank → flank_hold_world; Attack → opponent zone
             if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
                 goal_world = own_flag_world
-            elif team_id == "Defend" and own_flag_world is not None:
-                goal_world = own_flag_world
+            elif team_id == "Defend" and (defender_hold_world is not None or own_flag_world is not None):
+                goal_world = defender_hold_world if defender_hold_world is not None else own_flag_world
+            elif team_id == "Flank" and flank_hold_world is not None:
+                goal_world = flank_hold_world
             else:
                 goal_world = opponent_flag_world
             goal = _world_to_grid(float(goal_world[0]), float(goal_world[1]))
@@ -566,17 +727,14 @@ def block8_low_level_execution(
         else:
             direction = fallback_direction
 
-        # Stronger boundary avoidance: if we're already near a wall, do not
-        # choose a direction that drives us closer to that wall. Nudge the
-        # direction back toward the interior instead.
+        # Boundary nudge: avoid driving into walls. (After dr flip, N = +y = away from bottom.)
         row, col = start
         margin = (boundary_buffer + 1) if use_flag_goal else 1
-
-        if row < margin and direction in ("N", "NW", "NE"):
-            direction = "S"
-        elif row > grid_rows - margin - 1 and direction in ("S", "SW", "SE"):
+        # Near bottom (low row): don't command S/SW/SE (env -y); nudge to N
+        if row < margin and direction in ("S", "SW", "SE"):
             direction = "N"
-
+        elif row > grid_rows - margin - 1 and direction in ("N", "NW", "NE"):
+            direction = "S"
         if col < margin and direction in ("W", "NW", "SW"):
             direction = "E"
         elif col > grid_cols - margin - 1 and direction in ("E", "NE", "SE"):
@@ -701,11 +859,20 @@ def block11_learning_and_updates(gs: GlobalState) -> None:
 # ==========================================================
 # BLOCK 12: TERMINATION CHECK
 # ==========================================================
-def block12_termination_check(gs: GlobalState, cfg: Config) -> bool:
+def block12_termination_check(
+    gs: GlobalState, cfg: Config, env: Optional[Any] = None
+) -> Tuple[bool, str]:
     """
-    Win/loss achieved? Task finished? Human manually ends episode?.
+    Win/loss achieved? Task finished? Max steps? Human manually ends (handled by caller).
+    Returns (done, reason_string). If env is provided and env.dones["__all__"], returns
+    (True, env.message) for win/loss or time limit. Else if gs.t >= max_steps, returns
+    (True, "Max steps reached"). Otherwise (False, "").
     """
-    return gs.t >= cfg.max_steps_per_episode
+    if env is not None and getattr(env, "dones", {}).get("__all__", False):
+        return True, getattr(env, "message", "Game over.")
+    if gs.t >= cfg.max_steps_per_episode:
+        return True, "Max steps reached."
+    return False, ""
 
 
 # -----------------------------
@@ -735,7 +902,8 @@ def run_episode(cfg: Config) -> GlobalState:
         if cfg.log_every and gs.t % cfg.log_every == 0:
             print(f"[t={gs.t}] reward={reward.value:.2f} replan={should_replan}")
 
-        if block12_termination_check(gs, cfg):
+        done, _ = block12_termination_check(gs, cfg)
+        if done:
             break
 
     return gs

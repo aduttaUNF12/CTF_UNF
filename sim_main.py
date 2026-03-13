@@ -22,10 +22,14 @@ from all_blocks import (
     block7_subgoal_dispatching,
     block8_low_level_execution,
     block10_check_strategic_changes,
+    block12_termination_check,
 )
 
 # Wall avoidance: steer away when distance to any wall is below this (meters)
 WALL_SAFETY_DIST = 18.0
+
+# Defenders hold near home base but inset from boundaries so they don't run into walls (meters).
+DEFENDER_HOLD_INSET = 15.0
 
 def _angle_diff(a_deg: float, b_deg: float) -> float:
     """Angular difference in [-180, 180] degrees."""
@@ -161,8 +165,8 @@ def main():
 
             gs = env.global_state
             gs.t = step_count  # for Block 10 (check strategic changes / replan)
-            # Restrict gs.robots to blue agents only so strategy (Defend/Attack) applies only to blue
-            blue_rids = [f"R{i + 1}" for i in range(len(blue_agents))]
+            # Restrict gs.robots to blue agents only; use R0-R5 to match screen agent IDs (0-5)
+            blue_rids = [f"R{aid}" for aid in blue_agents]
             gs.robots = {
                 rid: {
                     "position": (env.players[blue_agents[i]].pos[0], env.players[blue_agents[i]].pos[1]),
@@ -172,9 +176,12 @@ def main():
                 for i, rid in enumerate(blue_rids)
             }
 
-            local_obs = block2_state_collection(gs)
+            blue_env_obs = {
+                aid: env.state_to_obs(aid, normalize=False) for aid in blue_agents
+            }
+            local_obs = block2_state_collection(gs, env_obs=blue_env_obs)
             gs = block3_global_state_encoding(gs, local_obs)
-            # CTF state for Block 4 and Block 10 (replan checks)
+            # CTF state for Block 10 (replan checks) and for Block 4 when we prompt
             ctf_state = {
                 "score_blue": env.game_score["blue_captures"],
                 "score_red": env.game_score["red_captures"],
@@ -185,24 +192,29 @@ def main():
                     env.players[aid].has_flag for aid in red_agents
                 ),
             }
-            llm_summary, strategies = block4_llm_state_summarization(
-                gs, Config(), ctf_state=ctf_state
-            )
-            # Human approves strategy once per episode (or when replan triggered)
+            # Only call Block 4 (and LLM) when we need to show strategies to the human.
+            # This avoids running LLM every step (slow/choppy) and ensures fresh strategies when reprompting.
             if human_plan is None:
+                llm_summary, strategies = block4_llm_state_summarization(
+                    gs, Config(), ctf_state=ctf_state
+                )
                 human_plan = block5_human_intervention(
                     strategies, Config(), llm_summary=llm_summary
                 )
-                # Anchor this plan so Block 10 doesn't immediately treat it as "replan"
                 last_replan_step = step_count
                 last_replan_ctf_state = dict(ctf_state)
             hrl = block6_high_level_rl_manager(gs, human_plan)
             block7_subgoal_dispatching(gs, hrl)
-            # Show strategy assignment when we just got a new plan (so user can verify)
+            # Show strategy assignment when we just got a new plan (R0-R5 = blue screen IDs 0-5)
             if human_plan is not None and last_replan_step == step_count:
                 def_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Defend"]
+                flank_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Flank"]
                 atk_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Attack"]
-                print(f"Strategy applied — Defend (→blue zone): {def_rids}; Attack (→red zone): {atk_rids}")
+                parts = [f"Defend (→blue zone): {def_rids}"]
+                if flank_rids:
+                    parts.append(f"Flank (→flank right): {flank_rids}")
+                parts.append(f"Attack (→red zone): {atk_rids}")
+                print("Strategy applied — " + "; ".join(parts))
             # If replan needed, clear plan so next step will re-prompt
             should_replan = block10_check_strategic_changes(
                 gs,
@@ -214,31 +226,40 @@ def main():
                 human_plan = None
                 last_replan_step = step_count
                 last_replan_ctf_state = dict(ctf_state)
-            # A* goals: red zone center (attack) and blue zone center (return with flag)
-            red_zone_center = env.flags[int(Team.RED_TEAM)].home
-            blue_zone_center = env.flags[int(Team.BLUE_TEAM)].home
+            # A* goals: red zone (attack), blue zone (defend / return with flag). Ensure (x,y) tuples.
+            _red_home = env.flags[int(Team.RED_TEAM)].home
+            _blue_home = env.flags[int(Team.BLUE_TEAM)].home
+            red_zone_center = (float(_red_home[0]), float(_red_home[1]))
+            blue_zone_center = (float(_blue_home[0]), float(_blue_home[1]))
+            # Defenders hold near home base, firmly in the middle band so they never touch bottom/top walls.
+            wx, wy = 120.0, 60.0  # match pyquaticus world_size
+            blue_hold_x = max(DEFENDER_HOLD_INSET, min(wx - DEFENDER_HOLD_INSET, blue_zone_center[0]))
+            blue_hold_y = max(22.0, min(38.0, blue_zone_center[1]))
+            defender_hold_world = (blue_hold_x, blue_hold_y)
+            # Flank right: waypoint near scrimmage (x=70) on the top flank (y=45), so they advance along the right side
+            flank_hold_world = (70.0, max(22.0, min(wy - DEFENDER_HOLD_INSET, 45.0)))
             robot_actions = block8_low_level_execution(
                 gs, local_obs, hrl,
                 opponent_flag_world=red_zone_center,
                 own_flag_world=blue_zone_center,
+                defender_hold_world=defender_hold_world,
+                flank_hold_world=flank_hold_world,
             )
 
-            # Unnormalized obs for blue (needed for wall distances)
-            blue_obs = {
-                aid: env.state_to_obs(aid, normalize=False) for aid in blue_agents
-            }
             for i, agent_id in enumerate(blue_agents):
-                rid = f"R{i + 1}"
+                rid = f"R{agent_id}"
                 block_action = "HOLD"
                 for ra in robot_actions:
                     if ra.get("robot_id") == rid:
                         block_action = ra.get("action", "HOLD")
                         break
                 player = env.players[agent_id]
-                # Physics-aware boundary avoidance: steer away from close walls
-                block_action = _wall_avoid_direction(
-                    blue_obs[agent_id], block_action, player.heading
-                )
+                # Defenders should hold near blue zone; wall avoidance was pushing them west (away from wall = toward red). Skip it for Defend team.
+                is_defender = gs.robots.get(rid, {}).get("team") == "Defend"
+                if not is_defender:
+                    block_action = _wall_avoid_direction(
+                        blue_env_obs[agent_id], block_action, player.heading
+                    )
                 actions[agent_id] = block_direction_to_env_action(
                     player.heading, block_action
                 )
@@ -252,6 +273,11 @@ def main():
 
             obs, _, _, _, _ = env.step(actions)
             step_count += 1
+            gs.t = step_count
+            done, reason = block12_termination_check(gs, cfg, env)
+            if done:
+                print(f"\n--- {reason} ---")
+                break
 
         env.render()
         clock.tick(30)
