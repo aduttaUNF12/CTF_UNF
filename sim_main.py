@@ -1,7 +1,8 @@
 """
 Capture the Flag simulation (HRL + human-in-the-loop).
-- Blue team: all_blocks pipeline (blocks 1–8) with A* low-level execution; Block 10 triggers
-  replan (return to Human+LLM) when strategic change detected.
+- Blue team: blocks 1–3, then user-typed commands (parsed → Block 5/6/7) and Block 8 A* execution.
+  Block 4 (LLM state summarization) is disabled for now — focus is parsing instructions and
+  moving blue agents accordingly.
 - Red team: base_combined heuristic policy (attack/defend).
 - Action space: 9 discrete actions (8 directions + hold).
 """
@@ -13,16 +14,18 @@ from pyquaticus.structs import Team
 from pyquaticus.base_policies.base_combined import Heuristic_CTF_Agent
 from all_blocks import (
     Config,
+    HRLAction,
     block1_environment_initialization,
     block2_state_collection,
     block3_global_state_encoding,
-    block4_llm_state_summarization,
-    block5_human_intervention,
-    block6_high_level_rl_manager,
-    block7_subgoal_dispatching,
+    # block4_llm_state_summarization,  # disabled: user instructions only (see main loop)
+    block5_human_intervention_from_text,
+    block6_high_level_rl_manager_with_commands,
+    block7_dispatch_assignments,
     block8_low_level_execution,
     block10_check_strategic_changes,
     block12_termination_check,
+    default_team_of,
 )
 
 # Wall avoidance: steer away when distance to any wall is below this (meters)
@@ -30,6 +33,36 @@ WALL_SAFETY_DIST = 18.0
 
 # Defenders hold near home base but inset from boundaries so they don't run into walls (meters).
 DEFENDER_HOLD_INSET = 15.0
+
+# Block 5/6: plain-text commands — used when human_plan is built (user prompt each replan).
+DEFAULT_TEXT_COMMANDS = [
+    "team A attack target T1",
+    "team B hold region R1",
+    "team C line at 50 35"
+]
+
+
+def _read_human_text_commands() -> list:
+    """Read how the blue team should behave: one instruction per line; empty line finishes."""
+    print("\n--- Blue team: your instructions (one line per command) ---")
+    print("These are parsed and mapped to per-robot movement (attack / hold / regroup / …).")
+    print("Examples: team A hold region R1 | all avoid red_zone | team B attack target T2")
+    print("          all regroup at 40 30 | team C line at 50 35 | all spread")
+    print("Empty line alone to finish (or press Enter immediately for defaults).\n")
+    lines = []
+    while True:
+        try:
+            line = input().rstrip()
+        except EOFError:
+            break
+        if line == "":
+            break
+        lines.append(line)
+    if not lines:
+        print(f"Using defaults: {DEFAULT_TEXT_COMMANDS}")
+        lines = list(DEFAULT_TEXT_COMMANDS)
+    return lines
+
 
 def _angle_diff(a_deg: float, b_deg: float) -> float:
     """Angular difference in [-180, 180] degrees."""
@@ -142,6 +175,7 @@ def main():
     clock = pygame.time.Clock()
     # Prompt human once per episode (or when Block 10 requests replan); reuse plan otherwise
     human_plan = None
+    robot_assignments = None  # Block 6 output: per-robot subgoals for Block 7/8
     step_count = 0
     last_replan_step = -1
     last_replan_ctf_state = None
@@ -175,13 +209,16 @@ def main():
                 }
                 for i, rid in enumerate(blue_rids)
             }
+            # Re-attach Block 6 assignments each step (gs.robots is rebuilt from env every frame).
+            if robot_assignments is not None:
+                block7_dispatch_assignments(gs, robot_assignments)
 
             blue_env_obs = {
                 aid: env.state_to_obs(aid, normalize=False) for aid in blue_agents
             }
             local_obs = block2_state_collection(gs, env_obs=blue_env_obs)
             gs = block3_global_state_encoding(gs, local_obs)
-            # CTF state for Block 10 (replan checks) and for Block 4 when we prompt
+            # CTF state for Block 10 (replan checks)
             ctf_state = {
                 "score_blue": env.game_score["blue_captures"],
                 "score_red": env.game_score["red_captures"],
@@ -192,29 +229,30 @@ def main():
                     env.players[aid].has_flag for aid in red_agents
                 ),
             }
-            # Only call Block 4 (and LLM) when we need to show strategies to the human.
-            # This avoids running LLM every step (slow/choppy) and ensures fresh strategies when reprompting.
+            # Block 4 (LLM state summarization) disabled — instructions come only from the user below.
+            # if human_plan is None:
+            #     llm_summary, strategies = block4_llm_state_summarization(
+            #         gs, Config(), ctf_state=ctf_state
+            #     )
             if human_plan is None:
-                llm_summary, strategies = block4_llm_state_summarization(
-                    gs, Config(), ctf_state=ctf_state
+                text_lines = _read_human_text_commands()
+                human_plan = block5_human_intervention_from_text(
+                    text_lines, enable_human_intervention=cfg.enable_human_intervention
                 )
-                human_plan = block5_human_intervention(
-                    strategies, Config(), llm_summary=llm_summary
+                team_of = default_team_of(blue_rids)
+                robot_assignments = block6_high_level_rl_manager_with_commands(
+                    blue_rids, human_plan, team_of
                 )
+                block7_dispatch_assignments(gs, robot_assignments)
                 last_replan_step = step_count
                 last_replan_ctf_state = dict(ctf_state)
-            hrl = block6_high_level_rl_manager(gs, human_plan)
-            block7_subgoal_dispatching(gs, hrl)
-            # Show strategy assignment when we just got a new plan (R0-R5 = blue screen IDs 0-5)
-            if human_plan is not None and last_replan_step == step_count:
-                def_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Defend"]
-                flank_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Flank"]
-                atk_rids = [rid for rid in blue_rids if gs.robots.get(rid, {}).get("team") == "Attack"]
-                parts = [f"Defend (→blue zone): {def_rids}"]
-                if flank_rids:
-                    parts.append(f"Flank (→flank right): {flank_rids}")
-                parts.append(f"Attack (→red zone): {atk_rids}")
-                print("Strategy applied — " + "; ".join(parts))
+            # Block 8 still takes HRLAction; team-based path unused when hl_assignment is set per robot.
+            hrl = HRLAction(teams={}, subgoals={}, request_replan=False)
+            # Show assignments when we just got a new plan (R0-R5 = blue screen IDs 0-5)
+            if human_plan is not None and last_replan_step == step_count and robot_assignments:
+                print("Strategy applied — per-robot assignments:")
+                for rid in blue_rids:
+                    print(f"  {rid}: {robot_assignments.get(rid)}")
             # If replan needed, clear plan so next step will re-prompt
             should_replan = block10_check_strategic_changes(
                 gs,
@@ -244,6 +282,7 @@ def main():
                 own_flag_world=blue_zone_center,
                 defender_hold_world=defender_hold_world,
                 flank_hold_world=flank_hold_world,
+                robot_assignments=robot_assignments,
             )
 
             for i, agent_id in enumerate(blue_agents):
@@ -254,8 +293,14 @@ def main():
                         block_action = ra.get("action", "HOLD")
                         break
                 player = env.players[agent_id]
-                # Defenders should hold near blue zone; wall avoidance was pushing them west (away from wall = toward red). Skip it for Defend team.
-                is_defender = gs.robots.get(rid, {}).get("team") == "Defend"
+                # Hold/protect/idle: skip aggressive wall nudge (same as legacy Defend team).
+                hl_a = gs.robots.get(rid, {}).get("hl_assignment") or {}
+                sub = str(hl_a.get("subgoal", ""))
+                is_defender = gs.robots.get(rid, {}).get("team") == "Defend" or (
+                    sub.startswith("HOLD")
+                    or sub.startswith("PROTECT")
+                    or sub == "IDLE"
+                )
                 if not is_defender:
                     block_action = _wall_avoid_direction(
                         blue_env_obs[agent_id], block_action, player.heading

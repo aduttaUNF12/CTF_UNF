@@ -6,6 +6,7 @@ import math
 import heapq
 import os
 import json
+import re
 
 try:
     import openai  # type: ignore[import]
@@ -15,7 +16,7 @@ except Exception:  # pragma: no cover - optional dependency
 # -----------------------------
 # Types / data structures
 # -----------------------------
-
+Cell = Tuple[int, int]
 Vec2 = Tuple[int, int]
 RobotId = str
 TeamId = str
@@ -60,12 +61,21 @@ class StrategyCandidate:
     uncertainties: List[str]
 
 @dataclass
+class ParsedCommand:
+    raw_text: str
+    action: str                     # hold, attack, avoid, protect, regroup, line, spread
+    scope: str                      # all, team, robot
+    target: str                     # all / team id / robot id
+    params: Dict[str, Any] = field(default_factory=dict)
+ 
+@dataclass
 class HumanPlan:
     priorities: List[str]
     safety_constraints: List[str]
     mission_goals: List[str]
     approved_strategies: List[str]
-    strategy_index: Optional[int] = None  # 1, 2, or 3 when user picks a candidate; None for custom text
+    parsed_commands: List[ParsedCommand] = field(default_factory=list)
+    strategy_index: Optional[int] = None  # legacy: LLM candidate index when using old block5
 
 @dataclass
 class Subgoal:
@@ -266,8 +276,10 @@ def block3_global_state_encoding(gs: GlobalState, local_obs: List[LocalObservati
 
 
 # ==========================================================
-# BLOCK 4: LLM STATE SUMMARIZATION (framework §4)
+# BLOCK 4: LLM STATE SUMMARIZATION
 # ==========================================================
+# NOTE: Not used by sim_main.py or run_episode() right now — user types plain-text
+# instructions instead (Block 5 from text → Block 6/7). Kept for future LLM integration.
 def block4_llm_state_summarization(
     gs: GlobalState, cfg: Config,
     ctf_state: Optional[Dict[str, Any]] = None,
@@ -450,8 +462,247 @@ def block4_llm_state_summarization(
         return llm_summary, strategies
 
 
+# -----------------------------
+# Human text commands (Block 5 / 6)
+# -----------------------------
+
+def parse_human_command(text: str) -> Optional[ParsedCommand]:
+    """
+    Parse a single plain-text command into ParsedCommand. Returns None if unrecognized.
+    Supported patterns (case-insensitive):
+      team A hold region R1
+      all avoid red_zone
+      robot R3 protect R1 radius 3
+      team B attack target T2
+      all regroup at 4 4
+      team C line at 5 8
+      all spread
+    """
+    t = text.strip()
+    if not t:
+        return None
+    raw = t
+    t_low = t.lower()
+
+    m = re.match(
+        r"^team\s+([abc])\s+hold\s+region\s+(\w+)",
+        t_low,
+        re.I,
+    )
+    if m:
+        team, region = m.group(1).upper(), m.group(2)
+        return ParsedCommand(
+            raw_text=raw,
+            action="hold",
+            scope="team",
+            target=team,
+            params={"region": region},
+        )
+
+    m = re.match(r"^all\s+avoid\s+(\w+)", t_low)
+    if m:
+        return ParsedCommand(
+            raw_text=raw,
+            action="avoid",
+            scope="all",
+            target="all",
+            params={"zone": m.group(1)},
+        )
+
+    m = re.match(
+        r"^robot\s+(r\d+)\s+protect\s+(r\d+)\s+radius\s+(\d+)",
+        t_low,
+        re.I,
+    )
+    if m:
+        rid_self, prot, rad = m.group(1).upper(), m.group(2).upper(), int(m.group(3))
+        return ParsedCommand(
+            raw_text=raw,
+            action="protect",
+            scope="robot",
+            target=rid_self,
+            params={"protect_target": prot, "radius": rad},
+        )
+
+    m = re.match(r"^team\s+([abc])\s+attack\s+target\s+(\w+)", t_low, re.I)
+    if m:
+        team, tgt = m.group(1).upper(), m.group(2)
+        return ParsedCommand(
+            raw_text=raw,
+            action="attack",
+            scope="team",
+            target=team,
+            params={"attack_target": tgt},
+        )
+
+    m = re.match(r"^all\s+regroup\s+at\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", t_low)
+    if m:
+        x, y = float(m.group(1)), float(m.group(2))
+        return ParsedCommand(
+            raw_text=raw,
+            action="regroup",
+            scope="all",
+            target="all",
+            params={"cell": (x, y)},
+        )
+
+    m = re.match(r"^team\s+([abc])\s+line\s+at\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", t_low, re.I)
+    if m:
+        team = m.group(1).upper()
+        ax, ay = float(m.group(2)), float(m.group(3))
+        return ParsedCommand(
+            raw_text=raw,
+            action="line",
+            scope="team",
+            target=team,
+            params={"anchor": (ax, ay)},
+        )
+
+    if re.match(r"^all\s+spread\b", t_low):
+        return ParsedCommand(
+            raw_text=raw,
+            action="spread",
+            scope="all",
+            target="all",
+            params={},
+        )
+
+    return None
+
+
+def command_applies_to_robot(cmd: ParsedCommand, rid: RobotId, team_of: Dict[str, str]) -> bool:
+    """Whether command cmd applies to robot rid given team membership (A/B/C)."""
+    scope = cmd.scope
+    target = cmd.target.upper() if isinstance(cmd.target, str) else str(cmd.target)
+    rid_u = rid.upper()
+    team = team_of.get(rid, "A").upper()
+
+    if scope == "all":
+        return True
+    if scope == "team":
+        return target == team
+    if scope == "robot":
+        # protect: only the named robot
+        if cmd.action == "protect":
+            return rid_u == target
+        return rid_u == target
+    return False
+
+
+def default_team_of(robot_ids: List[RobotId]) -> Dict[str, str]:
+    """Assign teams A/B/C in round-robin (same idea as llmagent stub)."""
+    out: Dict[str, str] = {}
+    for i, rid in enumerate(robot_ids):
+        out[rid] = ["A", "B", "C"][i % 3]
+    return out
+
+
+def block5_human_intervention_from_text(
+    human_text_commands: List[str],
+    enable_human_intervention: bool = True,
+) -> HumanPlan:
+    """
+    Human types commands in plain text (one string per line).
+    Example commands:
+      - team A hold region R1
+      - all avoid red_zone
+      - robot R3 protect R1 radius 3
+      - team B attack target T2
+      - all regroup at 4 4
+      - team C line at 5 8
+      - all spread
+    """
+    if not enable_human_intervention:
+        return HumanPlan([], [], [], [], [], None)
+
+    parsed_commands: List[ParsedCommand] = []
+    priorities: List[str] = []
+    safety_constraints: List[str] = []
+    mission_goals: List[str] = []
+    approved_strategies: List[str] = []
+
+    for text in human_text_commands:
+        cmd = parse_human_command(text)
+        if cmd is not None:
+            parsed_commands.append(cmd)
+            approved_strategies.append(text)
+
+            if cmd.action == "avoid":
+                safety_constraints.append(text)
+            elif cmd.action in ["hold", "protect", "regroup", "line", "spread"]:
+                priorities.append(text)
+            elif cmd.action == "attack":
+                mission_goals.append(text)
+
+    return HumanPlan(
+        priorities=priorities,
+        safety_constraints=safety_constraints or ["Avoid red_zone"],
+        mission_goals=mission_goals,
+        approved_strategies=approved_strategies,
+        parsed_commands=parsed_commands,
+        strategy_index=None,
+    )
+
+
+def block6_high_level_rl_manager_with_commands(
+    robot_ids: List[str],
+    human_plan: HumanPlan,
+    team_of: Dict[str, str],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns high-level assignments per robot from parsed plain-text commands.
+    """
+    assignments: Dict[str, Dict[str, Any]] = {}
+
+    for rid in robot_ids:
+        assignments[rid] = {"subgoal": "IDLE", "target_cell": None}
+
+    for cmd in human_plan.parsed_commands:
+        for rid in robot_ids:
+            if not command_applies_to_robot(cmd, rid, team_of):
+                continue
+
+            if cmd.action == "hold":
+                assignments[rid]["subgoal"] = f"HOLD_{cmd.params['region']}"
+                assignments[rid]["target_region"] = cmd.params["region"]
+
+            elif cmd.action == "avoid":
+                assignments[rid].setdefault("avoid_zones", [])
+                assignments[rid]["avoid_zones"].append(cmd.params["zone"])
+
+            elif cmd.action == "protect":
+                assignments[rid]["subgoal"] = f"PROTECT_{cmd.params['protect_target']}"
+                assignments[rid]["protect_target"] = cmd.params["protect_target"]
+                assignments[rid]["radius"] = cmd.params["radius"]
+
+            elif cmd.action == "attack":
+                assignments[rid]["subgoal"] = f"ATTACK_{cmd.params['attack_target']}"
+                assignments[rid]["attack_target"] = cmd.params["attack_target"]
+
+            elif cmd.action == "regroup":
+                assignments[rid]["subgoal"] = "REGROUP"
+                assignments[rid]["target_cell"] = cmd.params["cell"]
+
+            elif cmd.action == "line":
+                assignments[rid]["subgoal"] = "LINE_FORMATION"
+                assignments[rid]["anchor"] = cmd.params["anchor"]
+
+            elif cmd.action == "spread":
+                assignments[rid]["subgoal"] = "SPREAD"
+
+    return assignments
+
+
+def block7_dispatch_assignments(gs: GlobalState, assignments: Dict[str, Dict[str, Any]]) -> None:
+    """Attach per-robot high-level assignment for Block 8 (replaces team-only dispatch)."""
+    for rid, a in assignments.items():
+        if rid not in gs.robots:
+            continue
+        gs.robots[rid]["hl_assignment"] = dict(a)
+
+
 # ==========================================================
-# BLOCK 5: HUMAN STRATEGY INTERVENTION
+# BLOCK 5 (legacy): LLM strategy menu — kept for all_blocks.run_episode
 # ==========================================================
 def block5_human_intervention(
     strategies: List[StrategyCandidate], cfg: Config,
@@ -463,12 +714,13 @@ def block5_human_intervention(
     Caller should invoke once per episode (or when replanning) and reuse the returned plan.
     """
     if not cfg.enable_human_intervention:
-        return HumanPlan([], [], [], [], None)
+        return HumanPlan([], [], [], [], [], None)
 
     if not strategies:
         return HumanPlan(
             priorities=[], safety_constraints=[], mission_goals=[],
             approved_strategies=["No strategy available"],
+            parsed_commands=[],
             strategy_index=None,
         )
 
@@ -496,6 +748,7 @@ def block5_human_intervention(
         safety_constraints=["Avoid red_zone"],
         mission_goals=["Secure perimeter", "Capture opponent flag"],
         approved_strategies=[approved],
+        parsed_commands=[],
         strategy_index=strategy_index,
     )
 
@@ -660,6 +913,38 @@ def _build_grid(
     return grid
 
 
+def _goal_world_from_hl_assignment(
+    assignment: Dict[str, Any],
+    opponent_flag_world: Tuple[float, float],
+    own_flag_world: Optional[Tuple[float, float]],
+    defender_hold_world: Optional[Tuple[float, float]],
+    flank_hold_world: Optional[Tuple[float, float]],
+) -> Optional[Tuple[float, float]]:
+    """Map Block 6 command assignment to a world (x, y) goal. None => HOLD."""
+    sg = str(assignment.get("subgoal", "IDLE"))
+    tc = assignment.get("target_cell")
+    if tc and hasattr(tc, "__len__") and len(tc) >= 2:
+        tc_world = (float(tc[0]), float(tc[1]))
+    else:
+        tc_world = None
+    if sg == "IDLE" or sg.startswith("IDLE"):
+        return None
+    if sg.startswith("ATTACK"):
+        return tc_world or opponent_flag_world
+    if sg.startswith("HOLD") or sg.startswith("PROTECT"):
+        return tc_world or defender_hold_world or own_flag_world
+    if sg == "REGROUP":
+        return tc_world or defender_hold_world or own_flag_world
+    if sg == "LINE_FORMATION":
+        an = assignment.get("anchor")
+        if an and len(an) >= 2:
+            return (float(an[0]), float(an[1]))
+        return flank_hold_world
+    if sg == "SPREAD":
+        return tc_world or flank_hold_world
+    return opponent_flag_world
+
+
 # ==========================================================
 # BLOCK 8: LOW-LEVEL MULTI-AGENT EXECUTION 
 # ==========================================================
@@ -670,12 +955,14 @@ def block8_low_level_execution(
     own_flag_world: Optional[Tuple[float, float]] = None,
     defender_hold_world: Optional[Tuple[float, float]] = None,
     flank_hold_world: Optional[Tuple[float, float]] = None,
+    robot_assignments: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Each robot Ri uses policy (here A* placeholder for MAPPO/MASAC) to select primitive action
     (movement). Inputs: local obs oi, encoded subgoal g_k. Outputs: action ai.
     CTF: carrier → own zone; Defend → defender_hold_world; Flank → flank_hold_world (flank right);
-    Attack → opponent zone. Boundary buffer keeps paths inside play area.
+    Attack → opponent zone. If robot_assignments is set (Block 6 command mode), goals follow
+    per-robot hl_assignment / assignment dict instead of team_id. Boundary buffer keeps paths inside play area.
     """
     use_flag_goal = opponent_flag_world is not None
     # boundary_buffer = agent radius in cells so agents can get as close to walls as allowed
@@ -687,33 +974,62 @@ def block8_low_level_execution(
 
     for o in local_obs:
         rid = o.robot_id
-        team_id = gs.robots.get(rid, {}).get("team")
-        if team_id is None or team_id not in hrl.subgoals:
-            robot_actions.append({"robot_id": rid, "action": "HOLD"})
-            continue
-
-        subgoal = hrl.subgoals[team_id]
-        fallback_direction = pick_direction_from_vector(subgoal.vector)
         pos = gs.robots.get(rid, {}).get("position", (0, 0))
         x, y = pos
         start = _world_to_grid(x, y)
 
-        if use_flag_goal:
-            # Carrier → own zone; Defend → defender_hold_world; Flank → flank_hold_world; Attack → opponent zone
-            if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
-                goal_world = own_flag_world
-            elif team_id == "Defend" and (defender_hold_world is not None or own_flag_world is not None):
-                goal_world = defender_hold_world if defender_hold_world is not None else own_flag_world
-            elif team_id == "Flank" and flank_hold_world is not None:
-                goal_world = flank_hold_world
+        # --- Per-robot command assignments (Block 5/6 text commands) ---
+        hl: Optional[Dict[str, Any]] = None
+        if robot_assignments is not None and rid in robot_assignments:
+            hl = robot_assignments[rid]
+        elif gs.robots.get(rid, {}).get("hl_assignment") is not None:
+            hl = gs.robots[rid]["hl_assignment"]
+
+        if hl is not None:
+            subgoal_vec = encode_subgoal(str(hl.get("subgoal", "cmd")))
+            fallback_direction = pick_direction_from_vector(subgoal_vec)
+            if use_flag_goal:
+                if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
+                    goal_world = own_flag_world
+                else:
+                    gwl = _goal_world_from_hl_assignment(
+                        hl, opponent_flag_world, own_flag_world, defender_hold_world, flank_hold_world
+                    )
+                    if gwl is None:
+                        robot_actions.append({"robot_id": rid, "action": "HOLD"})
+                        continue
+                    goal_world = gwl
+                goal = _world_to_grid(float(goal_world[0]), float(goal_world[1]))
             else:
-                goal_world = opponent_flag_world
-            goal = _world_to_grid(float(goal_world[0]), float(goal_world[1]))
+                drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
+                goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
+                goal_col = clamp(start[1] + goal_offset_cells * dcol, 0, grid_cols - 1)
+                goal = (goal_row, goal_col)
         else:
-            drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
-            goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
-            goal_col = clamp(start[1] + goal_offset_cells * dcol, 0, grid_cols - 1)
-            goal = (goal_row, goal_col)
+            team_id = gs.robots.get(rid, {}).get("team")
+            if team_id is None or team_id not in hrl.subgoals:
+                robot_actions.append({"robot_id": rid, "action": "HOLD"})
+                continue
+
+            subgoal = hrl.subgoals[team_id]
+            fallback_direction = pick_direction_from_vector(subgoal.vector)
+
+            if use_flag_goal:
+                # Carrier → own zone; Defend → defender_hold_world; Flank → flank_hold_world; Attack → opponent zone
+                if own_flag_world is not None and gs.robots.get(rid, {}).get("has_flag", False):
+                    goal_world = own_flag_world
+                elif team_id == "Defend" and (defender_hold_world is not None or own_flag_world is not None):
+                    goal_world = defender_hold_world if defender_hold_world is not None else own_flag_world
+                elif team_id == "Flank" and flank_hold_world is not None:
+                    goal_world = flank_hold_world
+                else:
+                    goal_world = opponent_flag_world
+                goal = _world_to_grid(float(goal_world[0]), float(goal_world[1]))
+            else:
+                drow, dcol = _DIRECTION_TO_OFFSET.get(fallback_direction, (0, 0))
+                goal_row = clamp(start[0] + goal_offset_cells * drow, 0, grid_rows - 1)
+                goal_col = clamp(start[1] + goal_offset_cells * dcol, 0, grid_cols - 1)
+                goal = (goal_row, goal_col)
 
         if start == goal:
             robot_actions.append({"robot_id": rid, "action": "HOLD"})
@@ -791,7 +1107,7 @@ def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]
 
 
 # Replan every this many env steps (set 0 to disable periodic replan)
-REPLAN_INTERVAL_STEPS = 60
+REPLAN_INTERVAL_STEPS = 120
 
 # ==========================================================
 # BLOCK 10: CHECK FOR STRATEGIC CHANGES
@@ -884,13 +1200,24 @@ def run_episode(cfg: Config) -> GlobalState:
     while True:
         local_obs = block2_state_collection(gs)
         gs = block3_global_state_encoding(gs, local_obs)
-        llm_summary, strategies = block4_llm_state_summarization(gs, cfg)
-        human_plan = block5_human_intervention(strategies, cfg)
+        # Block 4 (LLM summarization) disabled — use parsed user-style commands instead.
+        # llm_summary, strategies = block4_llm_state_summarization(gs, cfg)
+        # human_plan = block5_human_intervention(strategies, cfg)
+        blue_rids = list(gs.robots.keys())
+        human_plan = block5_human_intervention_from_text(
+            ["team A attack target T1"], enable_human_intervention=cfg.enable_human_intervention
+        )
+        team_of = default_team_of(blue_rids)
+        robot_assignments = block6_high_level_rl_manager_with_commands(
+            blue_rids, human_plan, team_of
+        )
+        block7_dispatch_assignments(gs, robot_assignments)
+        hrl = HRLAction(teams={}, subgoals={}, request_replan=False)
         gs.history["human_constraints"].extend(human_plan.safety_constraints)
 
-        hrl = block6_high_level_rl_manager(gs, human_plan)
-        block7_subgoal_dispatching(gs, hrl)
-        robot_actions = block8_low_level_execution(gs, local_obs, hrl)
+        robot_actions = block8_low_level_execution(
+            gs, local_obs, hrl, robot_assignments=robot_assignments
+        )
         reward = block9_environment_transition(gs, robot_actions)
 
         should_replan = block10_check_strategic_changes(gs) or hrl.request_replan
