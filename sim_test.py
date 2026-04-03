@@ -481,8 +481,62 @@ def block4_system_summary(global_state: GlobalState) -> str:
         summary.append("No red threats visible")
  
     return " | ".join(summary)
- 
- 
+
+
+def _pyquaticus_global_state_for_block4(
+    env: Any,
+    blue_agents: List[Any],
+    red_agents: List[Any],
+    timestep: int,
+) -> GlobalState:
+    """
+    Build sim_test `GlobalState` from PyQuaticus so `block4_system_summary` can run unchanged.
+    Positions are world (x,y) rounded to integers; alive counts exclude tagged agents.
+    """
+    blue_positions: Dict[RobotId, Cell] = {}
+    for aid in blue_agents:
+        p = env.players[aid]
+        blue_positions[f"R{aid}"] = (int(round(p.pos[0])), int(round(p.pos[1])))
+    red_positions: Dict[RobotId, Cell] = {}
+    for aid in red_agents:
+        p = env.players[aid]
+        red_positions[f"R{aid}"] = (int(round(p.pos[0])), int(round(p.pos[1])))
+    alive_blue = sum(1 for a in blue_agents if not env.players[a].is_tagged)
+    alive_red = sum(1 for a in red_agents if not env.players[a].is_tagged)
+    # PyQuaticus: flags[0] = blue, flags[1] = red (see pyquaticus.structs.Team)
+    bh = env.flags[0].home
+    rh = env.flags[1].home
+    # Optional: coarse "contested" when both teams occupy center band (world x in [45,75], y in [20,40])
+    contested: List[str] = []
+    for bp in blue_positions.values():
+        for rp in red_positions.values():
+            if (
+                45 <= bp[0] <= 75
+                and 45 <= rp[0] <= 75
+                and 20 <= bp[1] <= 40
+                and 20 <= rp[1] <= 40
+                and manhattan(bp, rp) <= 25
+            ):
+                contested.append("CENTER_BAND")
+                break
+        if contested:
+            break
+    threat_map: Dict[RobotId, float] = {}
+    for rid, pos in red_positions.items():
+        threat_map[rid] = 1.0 + 0.01 * float(pos[0])
+    return GlobalState(
+        timestep=timestep,
+        blue_positions=blue_positions,
+        red_positions=red_positions,
+        alive_blue=alive_blue,
+        alive_red=alive_red,
+        blue_base=(int(round(bh[0])), int(round(bh[1]))),
+        red_base=(int(round(rh[0])), int(round(rh[1]))),
+        contested_regions=contested,
+        threat_map=threat_map,
+    )
+
+
 # =========================================================
 
 # BLOCK 5 — HUMAN COMMAND INTERFACE (BLUE ONLY)
@@ -1338,12 +1392,17 @@ def main_pyquaticus() -> None:
     import pygame
     import threading
     import queue
+    import json
+    import os
+    from datetime import datetime
+    from pathlib import Path
     import sys as _sys
 
     from pyquaticus.envs.pyquaticus import PyQuaticusEnv
     from pyquaticus.config import ACTION_MAP
     from pyquaticus.structs import Team
     from pyquaticus.base_policies.base_combined import Heuristic_CTF_Agent
+    from dashboard_tracker import GameAnalyticsTracker
 
     from all_blocks import (
         Config,
@@ -1353,7 +1412,6 @@ def main_pyquaticus() -> None:
         block3_global_state_encoding,
         block7_dispatch_assignments,
         block8_low_level_execution,
-        block10_check_strategic_changes,
         block12_termination_check,
     )
 
@@ -1554,7 +1612,47 @@ def main_pyquaticus() -> None:
 
     cfg = Config(num_robots=2 * team_size)
     env.global_state = block1_environment_initialization(cfg)
+    gs = env.global_state
+    gs.history.setdefault("actions", [])
+    gs.history.setdefault("rewards", [])
+    gs.history.setdefault("pyquaticus_steps", [])
+    gs.history.setdefault("block4_summaries", [])
+    gs.history.setdefault("block11_metrics", [])
+    _block4_print_every = int(os.environ.get("BLOCK4_PRINT_EVERY", "30"))
+    _metrics_every = int(os.environ.get("METRICS_EVERY", "10"))
 
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    jsonl_path = logs_dir / f"pyquaticus_run_{run_stamp}.jsonl"
+    print(f"[logging] Writing JSONL step log to: {jsonl_path}")
+
+    # Dashboard tracker (command compliance/violation + event ingest)
+    tracker = GameAnalyticsTracker()
+    match_id = f"pyq_{run_stamp}"
+    tracker.start_match(match_id, timestamp=0.0)
+
+    # Block 11 integration state (pyquaticus -> sim_test Metrics adapter).
+    metrics = Metrics()
+    metric_robots: Dict[str, Robot] = {}
+    prev_pos: Dict[str, Tuple[float, float]] = {}
+    prev_tagged: Dict[str, bool] = {}
+    prev_scores = {
+        "blue": int(env.game_score.get("blue_captures", 0)),
+        "red": int(env.game_score.get("red_captures", 0)),
+    }
+    for aid in env.agents:
+        rid = f"R{aid}"
+        team_name = "BLUE" if aid in blue_agents else "RED"
+        p = env.players[aid]
+        pos_i = (int(round(p.pos[0])), int(round(p.pos[1])))
+        metric_robots[rid] = Robot(robot_id=rid, team=team_name, position=pos_i, alive=not p.is_tagged)
+        prev_pos[rid] = (float(p.pos[0]), float(p.pos[1]))
+        prev_tagged[rid] = bool(p.is_tagged)
+
+    blue_policies = [
+        Heuristic_CTF_Agent(agent_id=aid, team=Team.BLUE_TEAM, mode=mode) for aid in blue_agents
+    ]
     red_policies = [
         Heuristic_CTF_Agent(agent_id=aid, team=Team.RED_TEAM, mode=mode) for aid in red_agents
     ]
@@ -1566,8 +1664,10 @@ def main_pyquaticus() -> None:
     human_plan = None
     robot_assignments = None
     step_count = 0
-    last_replan_step = -1
-    last_replan_ctf_state = None
+    # Snapshot CTF state at plan time for event-driven replans (no periodic trigger).
+    last_replan_ctf_state: Optional[Dict[str, Any]] = None
+    last_user_commands: List[Dict[str, Any]] = []
+    last_block10_state: bool = False  # rising-edge detect to avoid replan spam
 
     while True:
         for event in pygame.event.get():
@@ -1617,6 +1717,13 @@ def main_pyquaticus() -> None:
             "red_has_blue_flag": any(env.players[aid].has_flag for aid in red_agents),
         }
 
+        # Block 4 — same `block4_system_summary` as grid-world, fed by PyQuaticus state.
+        gs_block4 = _pyquaticus_global_state_for_block4(env, blue_agents, red_agents, step_count)
+        block4_summary = block4_system_summary(gs_block4)
+        gs.history["block4_summaries"].append({"t": step_count, "summary": block4_summary})
+        if _block4_print_every > 0 and step_count % _block4_print_every == 0:
+            print(f"[Block4] {block4_summary}")
+
         # World goals for Block 8 mapping (also used to translate hold/attack targets).
         _red_home = env.flags[int(Team.RED_TEAM)].home
         _blue_home = env.flags[int(Team.BLUE_TEAM)].home
@@ -1640,8 +1747,44 @@ def main_pyquaticus() -> None:
                 blue_rids, human_plan, blue_zone_center, red_zone_center
             )
             block7_dispatch_assignments(gs, robot_assignments)
-            last_replan_step = step_count
             last_replan_ctf_state = dict(ctf_state)
+            last_user_commands = [
+                {
+                    "raw_text": c.raw_text,
+                    "action": c.action,
+                    "scope": c.scope,
+                    "target": c.target,
+                    "params": c.params,
+                }
+                for c in (human_plan.parsed_commands or [])
+            ]
+
+            # Register/refresh dashboard commands (simple move-to compliance).
+            # We use current step_count as a logical timestamp (also written to JSONL).
+            # Expire after 120 "seconds" (steps) by default.
+            issued_at = float(step_count)
+            expires_at = float(step_count + 120)
+            for idx, c in enumerate(human_plan.parsed_commands or []):
+                if c.action in ("move", "regroup", "defend") and "cell" in c.params:
+                    tx, ty = c.params["cell"]
+                    # scope mapping: sim_test cmd scope is all/robot; translate to dashboard scopes.
+                    if c.scope == "robot":
+                        scope = "player"
+                        target = str(c.target)
+                    else:
+                        scope = "all"
+                        target = "all"
+                    cmd = tracker.make_move_command(
+                        command_id=f"cmd_{step_count}_{idx}",
+                        issued_at=issued_at,
+                        expires_at=expires_at,
+                        scope=scope,
+                        target=target,
+                        text=c.raw_text,
+                        target_x=float(tx),
+                        target_y=float(ty),
+                    )
+                    tracker.add_command(match_id, cmd)
 
             print("Applied per-robot assignments:")
             for rid in blue_rids:
@@ -1666,34 +1809,200 @@ def main_pyquaticus() -> None:
             robot_assignments=robot_assignments,
         )
 
+        # Compute base_combined actions for all agents (blue+red), then override blue where human assigns.
+        obs_dict = {aid: env.state_to_obs(aid, normalize=False) for aid in env.agents}
+        base_actions_blue: Dict[int, int] = {}
+        for j, agent_id in enumerate(blue_agents):
+            act_17 = blue_policies[j].compute_action(obs_dict)
+            base_actions_blue[agent_id] = 8 if act_17 == 16 else act_17 % 8
+
         # Blue actions.
         for i, agent_id in enumerate(blue_agents):
             rid = f"R{agent_id}"
-            block_action = "HOLD"
-            for ra in robot_actions:
-                if ra.get("robot_id") == rid:
-                    block_action = ra.get("action", "HOLD")
-                    break
+            # Default: base_combined policy action.
+            final_act = base_actions_blue.get(agent_id, 8)
 
-            player = env.players[agent_id]
-            hl_a = gs.robots.get(rid, {}).get("hl_assignment") or {}
-            sub = str(hl_a.get("subgoal", ""))
-            is_defender = gs.robots.get(rid, {}).get("team") == "Defend" or (
-                sub.startswith("HOLD") or sub.startswith("PROTECT") or sub == "IDLE"
-            )
-            if not is_defender:
-                block_action = _wall_avoid_direction(
-                    blue_env_obs[agent_id], block_action, player.heading
-                )
-            actions[agent_id] = block_direction_to_env_action(player.heading, block_action)
+            # If the human provided a non-IDLE assignment for this robot, override base action.
+            if robot_assignments is not None:
+                a = robot_assignments.get(rid) or {}
+                sg = str(a.get("subgoal", "IDLE"))
+                if sg != "IDLE":
+                    block_action = "HOLD"
+                    for ra in robot_actions:
+                        if ra.get("robot_id") == rid:
+                            block_action = ra.get("action", "HOLD")
+                            break
+
+                    player = env.players[agent_id]
+                    hl_a = gs.robots.get(rid, {}).get("hl_assignment") or {}
+                    sub = str(hl_a.get("subgoal", ""))
+                    is_defender = gs.robots.get(rid, {}).get("team") == "Defend" or (
+                        sub.startswith("HOLD") or sub.startswith("PROTECT") or sub == "IDLE"
+                    )
+                    if not is_defender:
+                        block_action = _wall_avoid_direction(
+                            blue_env_obs[agent_id], block_action, player.heading
+                        )
+                    final_act = block_direction_to_env_action(player.heading, block_action)
+
+            actions[agent_id] = int(final_act)
 
         # Red actions.
-        obs_dict = {aid: env.state_to_obs(aid, normalize=False) for aid in env.agents}
         for j, agent_id in enumerate(red_agents):
             act_17 = red_policies[j].compute_action(obs_dict)
             actions[agent_id] = 8 if act_17 == 16 else act_17 % 8
 
-        env.step(actions)
+        # Pre-step carrier snapshot for capture attribution.
+        pre_step_has_flag = {aid: bool(env.players[aid].has_flag) for aid in env.agents}
+
+        # Step env and keep raw return for reward logging across API variants.
+        step_out = env.step(actions)
+        t_now = step_count
+
+        # Parse reward from env.step return in a version-tolerant way.
+        reward_payload: Any = None
+        if isinstance(step_out, tuple) and len(step_out) >= 2:
+            reward_payload = step_out[1]
+
+        # In-memory history logging (all_blocks-style).
+        for aid, act in actions.items():
+            gs.history["actions"].append({"t": t_now, "robot_id": f"R{aid}", "action": int(act)})
+        gs.history["rewards"].append({"t": t_now, "value": reward_payload, "reason": "pyquaticus_env_step"})
+
+        # Build a JSON-safe reward summary for file logging.
+        reward_summary: Dict[str, Any]
+        if isinstance(reward_payload, dict):
+            reward_summary = {}
+            for k, v in reward_payload.items():
+                try:
+                    reward_summary[str(k)] = float(v)
+                except Exception:
+                    reward_summary[str(k)] = str(v)
+        elif reward_payload is None:
+            reward_summary = {"raw": None}
+        else:
+            try:
+                reward_summary = {"raw": float(reward_payload)}
+            except Exception:
+                reward_summary = {"raw": str(reward_payload)}
+
+        # ---------- Block 11 adapter updates ----------
+        # Refresh per-robot adapter state from live pyquaticus players.
+        for aid in env.agents:
+            rid = f"R{aid}"
+            p = env.players[aid]
+            now_pos_f = (float(p.pos[0]), float(p.pos[1]))
+            now_pos_i = (int(round(p.pos[0])), int(round(p.pos[1])))
+            old_pos_f = prev_pos.get(rid, now_pos_f)
+
+            mr = metric_robots[rid]
+            mr.last_position = mr.position
+            mr.position = now_pos_i
+            mr.distance_covered += euclidean(
+                (int(round(old_pos_f[0])), int(round(old_pos_f[1]))), now_pos_i
+            )
+            mr.alive = not bool(p.is_tagged)
+
+            was_tagged = prev_tagged.get(rid, bool(p.is_tagged))
+            if (not was_tagged) and bool(p.is_tagged):
+                metrics.deaths[rid] += 1
+                mr.deaths += 1
+
+            prev_pos[rid] = now_pos_f
+            prev_tagged[rid] = bool(p.is_tagged)
+
+        # Attribute captures using pre-step carriers when score increases.
+        new_blue_score = int(env.game_score.get("blue_captures", 0))
+        new_red_score = int(env.game_score.get("red_captures", 0))
+        if new_blue_score > prev_scores["blue"]:
+            carriers = [f"R{aid}" for aid in blue_agents if pre_step_has_flag.get(aid, False)]
+            for rid in (carriers or []):
+                metrics.objective_captures[rid] += 1
+        if new_red_score > prev_scores["red"]:
+            carriers = [f"R{aid}" for aid in red_agents if pre_step_has_flag.get(aid, False)]
+            for rid in (carriers or []):
+                metrics.objective_captures[rid] += 1
+        prev_scores["blue"] = new_blue_score
+        prev_scores["red"] = new_red_score
+
+        # Dashboard event ingest: emit a movement event for each player.
+        # Uses world (x,y) and team id ("BLUE"/"RED") so command evaluation can run.
+        for aid in env.agents:
+            pid = f"R{aid}"
+            p = env.players[aid]
+            tracker.ingest_event(
+                {
+                    "match_id": match_id,
+                    "timestamp": float(t_now),
+                    "event": "move",
+                    "player_id": pid,
+                    "team_id": "BLUE" if aid in blue_agents else "RED",
+                    "x": float(p.pos[0]),
+                    "y": float(p.pos[1]),
+                }
+            )
+
+        # Command compliance vs current assignment target (blue only).
+        if robot_assignments:
+            for rid in blue_rids:
+                a = robot_assignments.get(rid) or {}
+                sg = str(a.get("subgoal", "IDLE"))
+                if sg == "IDLE":
+                    continue
+                tc = a.get("target_cell")
+                if tc and hasattr(tc, "__len__") and len(tc) >= 2:
+                    tgt = (float(tc[0]), float(tc[1]))
+                    cur = metric_robots[rid].position
+                    d = euclidean((int(round(tgt[0])), int(round(tgt[1]))), cur)
+                    if d <= 4.0:
+                        metrics.command_compliance[rid] += 1
+                    else:
+                        metrics.command_violations[rid] += 1
+
+        blue_metric_robots = {rid: r for rid, r in metric_robots.items() if rid in blue_rids}
+        red_metric_robots = {rid: r for rid, r in metric_robots.items() if rid not in blue_rids}
+        metrics_env = EnvironmentState(
+            blue_robots=blue_metric_robots,
+            red_robots=red_metric_robots,
+            timestep=t_now,
+            max_steps=cfg.max_steps_per_episode,
+            done=bool(getattr(env, "dones", {}).get("__all__", False)),
+        )
+        metrics_out: Optional[Dict[str, Any]] = None
+        if (_metrics_every > 0 and t_now % _metrics_every == 0) or bool(getattr(env, "dones", {}).get("__all__", False)):
+            metrics_out = block11_metrics_update(metrics_env, metrics)
+            gs.history["block11_metrics"].append({"t": t_now, "metrics": metrics_out})
+            if _metrics_every > 0 and t_now % _metrics_every == 0:
+                print(
+                    f"[Block11] t={t_now} blue_synergy={metrics_out['blue_synergy']} "
+                    f"red_synergy={metrics_out['red_synergy']}"
+                )
+
+        # File logging: one JSON record per env step (full detail).
+        step_record = {
+            "t": t_now,
+            "block4_summary": block4_summary,
+            "user_commands": last_user_commands,
+            "score": {
+                "blue": int(env.game_score.get("blue_captures", 0)),
+                "red": int(env.game_score.get("red_captures", 0)),
+            },
+            "actions": {str(aid): int(act) for aid, act in actions.items()},
+            "reward": reward_summary,
+            "ctf_state": ctf_state,
+            "robot_assignments": robot_assignments or {},
+            "block11_metrics": metrics_out,
+            "dashboard_command_status": {
+                "active_commands": len(tracker.active_commands.get(match_id, [])),
+                "status": tracker.command_status.get(match_id, {}),
+            },
+            "done": bool(getattr(env, "dones", {}).get("__all__", False)),
+            "message": str(getattr(env, "message", "")),
+        }
+        gs.history["pyquaticus_steps"].append(step_record)
+        with jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(step_record, ensure_ascii=True) + "\n")
+
         step_count += 1
         gs.t = step_count
 
@@ -1702,16 +2011,36 @@ def main_pyquaticus() -> None:
             print(f"\n--- {reason} ---")
             break
 
-        should_replan = block10_check_strategic_changes(
-            gs,
-            ctf_state=ctf_state,
-            last_replan_step=last_replan_step,
-            last_replan_ctf_state=last_replan_ctf_state,
+        # Block 10 (your grid-world definition): alive thresholds + contested regions.
+        # For PyQuaticus, we reuse the env-fed GlobalState built for Block 4.
+        # Note: `_pyquaticus_global_state_for_block4` only needs env + robot ids.
+        gs_block4_after = _pyquaticus_global_state_for_block4(
+            env, blue_agents, red_agents, gs.t
         )
+        should_replan_block10 = block10_strategic_change_detection(env, gs_block4_after)
+        # Only replan on the rising edge of Block 10 condition (False -> True).
+        block10_rising = should_replan_block10 and (not last_block10_state)
+        last_block10_state = should_replan_block10
+        red_scored_since_plan = False
+        red_took_flag_since_plan = False
+        if last_replan_ctf_state is not None:
+            red_scored_since_plan = (
+                ctf_state.get("score_red", 0) > last_replan_ctf_state.get("score_red", 0)
+            )
+            red_took_flag_since_plan = (
+                bool(ctf_state.get("red_has_blue_flag", False))
+                and not bool(last_replan_ctf_state.get("red_has_blue_flag", False))
+            )
+        should_replan = block10_rising or red_scored_since_plan or red_took_flag_since_plan
         if should_replan:
+            if red_scored_since_plan:
+                print("[Replan] Trigger: red score increased.")
+            elif red_took_flag_since_plan:
+                print("[Replan] Trigger: red has blue flag.")
+            elif block10_rising:
+                print("[Replan] Trigger: Block 10 strategic change.")
             human_plan = None
             robot_assignments = None
-            last_replan_step = step_count
             last_replan_ctf_state = dict(ctf_state)
 
         env.render()
