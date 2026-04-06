@@ -1402,7 +1402,7 @@ def main_pyquaticus() -> None:
     from pyquaticus.config import ACTION_MAP
     from pyquaticus.structs import Team
     from pyquaticus.base_policies.base_combined import Heuristic_CTF_Agent
-    from dashboard_tracker import GameAnalyticsTracker
+    from dashboard_command_tracker import GameAnalyticsTracker
 
     from all_blocks import (
         Config,
@@ -1663,11 +1663,15 @@ def main_pyquaticus() -> None:
     # Prompt user per-plan; Block 10 decides when to clear for a new prompt.
     human_plan = None
     robot_assignments = None
+    # When replan clears `human_plan`, Block 5 "done" / empty line should reuse this snapshot.
+    last_committed_human_plan: Optional[HumanPlan] = None
     step_count = 0
     # Snapshot CTF state at plan time for event-driven replans (no periodic trigger).
     last_replan_ctf_state: Optional[Dict[str, Any]] = None
     last_user_commands: List[Dict[str, Any]] = []
     last_block10_state: bool = False  # rising-edge detect to avoid replan spam
+    # Previous world position per agent for dashboard attack compliance (moving toward goal).
+    dash_prev_pos: Dict[str, Tuple[float, float]] = {}
 
     while True:
         for event in pygame.event.get():
@@ -1739,9 +1743,18 @@ def main_pyquaticus() -> None:
             )
             if new_plan.parsed_commands:
                 human_plan = new_plan
+            elif last_committed_human_plan is not None and last_committed_human_plan.parsed_commands:
+                human_plan = HumanPlan(
+                    parsed_commands=list(last_committed_human_plan.parsed_commands)
+                )
             else:
-                # No commands entered => keep an empty plan (robots will idle/hold).
+                # No commands entered and nothing to repeat (robots will idle/hold).
                 human_plan = HumanPlan(parsed_commands=[])
+
+            if human_plan.parsed_commands:
+                last_committed_human_plan = HumanPlan(
+                    parsed_commands=list(human_plan.parsed_commands)
+                )
 
             robot_assignments = _build_assignments_from_block5(
                 blue_rids, human_plan, blue_zone_center, red_zone_center
@@ -1785,6 +1798,57 @@ def main_pyquaticus() -> None:
                         target_y=float(ty),
                     )
                     tracker.add_command(match_id, cmd)
+
+            # Hold / attack / spread: map assignments to dashboard command semantics.
+            _dc = 0
+            for _rid in blue_rids:
+                _a = robot_assignments.get(_rid) or {}
+                _sg = str(_a.get("subgoal", "IDLE"))
+                _tc = _a.get("target_cell")
+                if _tc is None or not hasattr(_tc, "__len__") or len(_tc) < 2:
+                    continue
+                _tx, _ty = float(_tc[0]), float(_tc[1])
+                if _sg.startswith("HOLD_"):
+                    tracker.add_command(
+                        match_id,
+                        tracker.make_hold_command(
+                            command_id=f"cmd_{step_count}_hold_{_dc}",
+                            issued_at=issued_at,
+                            expires_at=expires_at,
+                            text="hold",
+                            anchor_x=_tx,
+                            anchor_y=_ty,
+                            player_id=_rid,
+                        ),
+                    )
+                    _dc += 1
+                elif _sg == "ATTACK_RED_BASE":
+                    tracker.add_command(
+                        match_id,
+                        tracker.make_attack_command(
+                            command_id=f"cmd_{step_count}_attack_{_dc}",
+                            issued_at=issued_at,
+                            expires_at=expires_at,
+                            text="attack",
+                            goal_x=float(red_zone_center[0]),
+                            goal_y=float(red_zone_center[1]),
+                            player_id=_rid,
+                        ),
+                    )
+                    _dc += 1
+            if any(
+                str((robot_assignments.get(br) or {}).get("subgoal", "")) == "SPREAD"
+                for br in blue_rids
+            ):
+                tracker.add_command(
+                    match_id,
+                    tracker.make_spread_command(
+                        command_id=f"cmd_{step_count}_spread",
+                        issued_at=issued_at,
+                        expires_at=expires_at,
+                        text="spread",
+                    ),
+                )
 
             print("Applied per-robot assignments:")
             for rid in blue_rids:
@@ -1927,9 +1991,12 @@ def main_pyquaticus() -> None:
 
         # Dashboard event ingest: emit a movement event for each player.
         # Uses world (x,y) and team id ("BLUE"/"RED") so command evaluation can run.
+        # prev_x/prev_y support attack-command compliance (moving toward goal vs drifting).
         for aid in env.agents:
             pid = f"R{aid}"
             p = env.players[aid]
+            cx, cy = float(p.pos[0]), float(p.pos[1])
+            prev = dash_prev_pos.get(pid, (cx, cy))
             tracker.ingest_event(
                 {
                     "match_id": match_id,
@@ -1937,10 +2004,35 @@ def main_pyquaticus() -> None:
                     "event": "move",
                     "player_id": pid,
                     "team_id": "BLUE" if aid in blue_agents else "RED",
-                    "x": float(p.pos[0]),
-                    "y": float(p.pos[1]),
+                    "x": cx,
+                    "y": cy,
+                    "prev_x": float(prev[0]),
+                    "prev_y": float(prev[1]),
                 }
             )
+            dash_prev_pos[pid] = (cx, cy)
+
+        # Spread command: one team-level snapshot per step (min pairwise distance among blue).
+        if len(blue_agents) < 2:
+            min_pair = 1e9
+        else:
+            bp = [env.players[aid].pos for aid in blue_agents]
+            min_pair = float("inf")
+            for i in range(len(bp)):
+                for j in range(i + 1, len(bp)):
+                    d = math.hypot(float(bp[i][0]) - float(bp[j][0]), float(bp[i][1]) - float(bp[j][1]))
+                    if d < min_pair:
+                        min_pair = d
+        tracker.ingest_event(
+            {
+                "match_id": match_id,
+                "timestamp": float(t_now),
+                "event": "spread_eval",
+                "player_id": "__spread__",
+                "team_id": "BLUE",
+                "min_pairwise_blue": min_pair,
+            }
+        )
 
         # Command compliance vs current assignment target (blue only).
         if robot_assignments:
@@ -1979,6 +2071,21 @@ def main_pyquaticus() -> None:
                 )
 
         # File logging: one JSON record per env step (full detail).
+        dash_status_raw = tracker.command_status.get(match_id, {})
+        dash_status_json = {
+            str(cmd_id): {
+                str(entity): {
+                    "compliant_events": int(st.compliant_events),
+                    "violation_events": int(st.violation_events),
+                    "first_compliance_time": (
+                        None if st.first_compliance_time is None else float(st.first_compliance_time)
+                    ),
+                    "active_time": float(getattr(st, "active_time", 0.0)),
+                }
+                for entity, st in (entity_map or {}).items()
+            }
+            for cmd_id, entity_map in (dash_status_raw or {}).items()
+        }
         step_record = {
             "t": t_now,
             "block4_summary": block4_summary,
@@ -1994,7 +2101,7 @@ def main_pyquaticus() -> None:
             "block11_metrics": metrics_out,
             "dashboard_command_status": {
                 "active_commands": len(tracker.active_commands.get(match_id, [])),
-                "status": tracker.command_status.get(match_id, {}),
+                "status": dash_status_json,
             },
             "done": bool(getattr(env, "dones", {}).get("__all__", False)),
             "message": str(getattr(env, "message", "")),
