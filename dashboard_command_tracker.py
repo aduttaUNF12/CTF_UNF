@@ -2,6 +2,12 @@
 Lightweight human-command compliance for sim_test (PyQuaticus JSONL).
 
 Kept separate from dashboard_tracker.py so the full analytics module stays unchanged.
+
+Compliance / violation match Block 11 in sim_test (progress-based, same eps):
+  - Compliance: within goal radius OR distance to target decreased vs previous position.
+  - Violation: distance to target increased vs previous position (and previous exists).
+  - Move/hold/attack: BLUE team only; events with is_tagged=True are not scored.
+  - Spread: uses prev_min_pairwise_blue on spread_eval events (team bunched vs last step).
 """
 
 from __future__ import annotations
@@ -49,6 +55,22 @@ def _dist(x1: float, y1: float, x2: float, y2: float) -> float:
     dx = x1 - x2
     dy = y1 - y2
     return math.sqrt(dx * dx + dy * dy)
+
+
+# Match sim_test Block 11 (_pq_goal_ok / _pq_cmd_eps) for JSONL dashboard_command_status.
+PQ_GOAL_OK = 4.0
+PQ_CMD_EPS = 0.35
+
+
+def _blue_untagged_move(ev: dict) -> bool:
+    """Human blue commands: only score BLUE agents that are not tagged."""
+    if str(ev.get("event")) != "move":
+        return False
+    if str(ev.get("team_id")) != "BLUE":
+        return False
+    if bool(ev.get("is_tagged")):
+        return False
+    return True
 
 
 class GameAnalyticsTracker:
@@ -127,26 +149,40 @@ class GameAnalyticsTracker:
         text: str,
         target_x: float,
         target_y: float,
-        compliance_radius: float = 4.0,
-        violation_radius: float = 25.0,
+        goal_ok: float = PQ_GOAL_OK,
+        progress_eps: float = PQ_CMD_EPS,
     ) -> HumanCommand:
         def is_compliance(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             x = ev.get("x")
             y = ev.get("y")
             if x is None or y is None:
                 return False
-            return _dist(float(x), float(y), target_x, target_y) <= compliance_radius
+            d_cur = _dist(float(x), float(y), target_x, target_y)
+            if d_cur <= goal_ok:
+                return True
+            px = ev.get("prev_x")
+            py = ev.get("prev_y")
+            if px is None or py is None:
+                return False
+            d_prev = _dist(float(px), float(py), target_x, target_y)
+            return d_cur < d_prev - progress_eps
 
         def is_violation(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             x = ev.get("x")
             y = ev.get("y")
             if x is None or y is None:
                 return False
-            return _dist(float(x), float(y), target_x, target_y) >= violation_radius
+            d_cur = _dist(float(x), float(y), target_x, target_y)
+            px = ev.get("prev_x")
+            py = ev.get("prev_y")
+            if px is None or py is None:
+                return False
+            d_prev = _dist(float(px), float(py), target_x, target_y)
+            return d_cur > d_prev + progress_eps
 
         return HumanCommand(
             command_id=command_id,
@@ -168,13 +204,13 @@ class GameAnalyticsTracker:
         anchor_x: float,
         anchor_y: float,
         player_id: str,
-        compliance_radius: float = 4.0,
-        violation_radius: float = 18.0,
+        goal_ok: float = PQ_GOAL_OK,
+        progress_eps: float = PQ_CMD_EPS,
     ) -> HumanCommand:
         pid = str(player_id)
 
         def is_compliance(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             if str(ev.get("player_id")) != pid:
                 return False
@@ -182,10 +218,18 @@ class GameAnalyticsTracker:
             y = ev.get("y")
             if x is None or y is None:
                 return False
-            return _dist(float(x), float(y), anchor_x, anchor_y) <= compliance_radius
+            d_cur = _dist(float(x), float(y), anchor_x, anchor_y)
+            if d_cur <= goal_ok:
+                return True
+            px = ev.get("prev_x")
+            py = ev.get("prev_y")
+            if px is None or py is None:
+                return False
+            d_prev = _dist(float(px), float(py), anchor_x, anchor_y)
+            return d_cur < d_prev - progress_eps
 
         def is_violation(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             if str(ev.get("player_id")) != pid:
                 return False
@@ -193,7 +237,13 @@ class GameAnalyticsTracker:
             y = ev.get("y")
             if x is None or y is None:
                 return False
-            return _dist(float(x), float(y), anchor_x, anchor_y) >= violation_radius
+            d_cur = _dist(float(x), float(y), anchor_x, anchor_y)
+            px = ev.get("prev_x")
+            py = ev.get("prev_y")
+            if px is None or py is None:
+                return False
+            d_prev = _dist(float(px), float(py), anchor_x, anchor_y)
+            return d_cur > d_prev + progress_eps
 
         return HumanCommand(
             command_id=command_id,
@@ -215,15 +265,13 @@ class GameAnalyticsTracker:
         goal_x: float,
         goal_y: float,
         player_id: str,
-        compliance_radius: float = 12.0,
-        violation_far_radius: float = 55.0,
-        closer_eps: float = 0.35,
-        farther_eps: float = 0.35,
+        goal_ok: float = PQ_GOAL_OK,
+        progress_eps: float = PQ_CMD_EPS,
     ) -> HumanCommand:
         pid = str(player_id)
 
         def is_compliance(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             if str(ev.get("player_id")) != pid:
                 return False
@@ -232,17 +280,17 @@ class GameAnalyticsTracker:
             if x is None or y is None:
                 return False
             d_cur = _dist(float(x), float(y), goal_x, goal_y)
-            if d_cur <= compliance_radius:
+            if d_cur <= goal_ok:
                 return True
             px = ev.get("prev_x")
             py = ev.get("prev_y")
             if px is None or py is None:
                 return False
             d_prev = _dist(float(px), float(py), goal_x, goal_y)
-            return d_cur < d_prev - closer_eps
+            return d_cur < d_prev - progress_eps
 
         def is_violation(ev: dict) -> bool:
-            if str(ev.get("event")) != "move":
+            if not _blue_untagged_move(ev):
                 return False
             if str(ev.get("player_id")) != pid:
                 return False
@@ -251,14 +299,12 @@ class GameAnalyticsTracker:
             if x is None or y is None:
                 return False
             d_cur = _dist(float(x), float(y), goal_x, goal_y)
-            if d_cur >= violation_far_radius:
-                return True
             px = ev.get("prev_x")
             py = ev.get("prev_y")
             if px is None or py is None:
                 return False
             d_prev = _dist(float(px), float(py), goal_x, goal_y)
-            return d_cur > d_prev + farther_eps
+            return d_cur > d_prev + progress_eps
 
         return HumanCommand(
             command_id=command_id,
@@ -278,25 +324,46 @@ class GameAnalyticsTracker:
         expires_at: float,
         text: str,
         min_pairwise_ok: float = 14.0,
-        cluster_violation_below: float = 8.0,
+        progress_eps: float = PQ_CMD_EPS,
     ) -> HumanCommand:
+        """
+        Progress-based spread: compliance when spread is good or improved vs prev snapshot;
+        violation when min pairwise distance drops vs previous step (see prev_min_pairwise_blue).
+        """
+
         def is_compliance(ev: dict) -> bool:
             if str(ev.get("event")) != "spread_eval":
                 return False
             try:
-                d = float(ev.get("min_pairwise_blue", 0.0))
+                m = float(ev.get("min_pairwise_blue", 0.0))
             except (TypeError, ValueError):
                 return False
-            return d >= min_pairwise_ok
+            if m >= min_pairwise_ok:
+                return True
+            pv = ev.get("prev_min_pairwise_blue")
+            if pv is None:
+                return False
+            try:
+                pv_f = float(pv)
+            except (TypeError, ValueError):
+                return False
+            return m > pv_f + 1e-6
 
         def is_violation(ev: dict) -> bool:
             if str(ev.get("event")) != "spread_eval":
                 return False
             try:
-                d = float(ev.get("min_pairwise_blue", 0.0))
+                m = float(ev.get("min_pairwise_blue", 0.0))
             except (TypeError, ValueError):
                 return False
-            return d < cluster_violation_below
+            pv = ev.get("prev_min_pairwise_blue")
+            if pv is None:
+                return False
+            try:
+                pv_f = float(pv)
+            except (TypeError, ValueError):
+                return False
+            return m < pv_f - progress_eps
 
         return HumanCommand(
             command_id=command_id,

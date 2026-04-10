@@ -640,15 +640,38 @@ def parse_blue_command(text: str) -> Optional[ParsedCommand]:
     return None
  
  
-def block5_human_command_interface(first_turn: bool = False) -> HumanPlan:
+def generate_llm_summary(env: EnvironmentState) -> str:
 
-    """
+    blue_alive = [r for r in env.blue_robots.values() if r.alive]
 
-    On the first turn, allow human to type commands.
+    red_alive = [r for r in env.red_robots.values() if r.alive]
 
-    On later turns, user can just type 'done' if they want to keep strategy unchanged.
+    summary = []
 
-    """
+    summary.append(f"Blue agents alive: {len(blue_alive)}")
+
+    summary.append(f"Red agents alive: {len(red_alive)}")
+
+    blue_positions = [f"{r.robot_id}:{r.position}" for r in blue_alive]
+
+    red_positions = [f"{r.robot_id}:{r.position}" for r in red_alive]
+
+    summary.append("Blue positions: " + ", ".join(blue_positions) if blue_positions else "No blue agents alive")
+
+    summary.append("Red positions: " + ", ".join(red_positions) if red_positions else "No red agents alive")
+
+    blue_score = sum(r.kills for r in env.blue_robots.values())
+
+    red_score = sum(r.kills for r in env.red_robots.values())
+
+    summary.append(f"Blue score: {blue_score}")
+
+    summary.append(f"Red score: {red_score}")
+
+    return "\n".join(summary)
+
+
+def block5_human_command_interface(env: EnvironmentState, first_turn: bool = False) -> HumanPlan:
 
     if first_turn:
 
@@ -657,37 +680,48 @@ def block5_human_command_interface(first_turn: bool = False) -> HumanPlan:
     else:
 
         print("\nEnter updated BLUE team commands, or type 'done' to keep current strategy.")
- 
-    print("Examples:")
 
-    print("  all move to 4 4")
+    print("\nOptions:")
 
-    print("  robot B1 move to 3 5")
+    print("0 -> Show current world state summary")
 
-    print("  all hold region R1")
+    print("Type commands like:")
 
-    print("  robot B2 defend 4 4")
+    print("all move to 4 4")
 
-    print("  all attack red_base")
+    print("robot B1 move to 3 5")
 
-    print("  all regroup at 2 2")
+    print("all hold region R1")
 
-    print("  all spread")
- 
-    print("Type 'done' OR press Enter on an empty line to start/resume simulation.\n")
+    print("all attack red_base")
+
+    print("all regroup at 2 2")
+
+    print("all spread")
+
+    print("Type 'done' OR press Enter on an empty line to finish.\n")
 
     commands: List[ParsedCommand] = []
- 
+
     while True:
 
-        # Some terminals may send hidden unicode whitespace; normalize before checking.
         text = input("BLUE CMD > ")
         text_norm = text.replace("\u200b", "").replace("\ufeff", "").strip()
+
+        if text_norm == "0":
+
+            print("\n===== CURRENT WORLD STATE =====")
+
+            print(generate_llm_summary(env))
+
+            print("================================\n")
+
+            continue
 
         if text_norm == "" or text_norm.lower() == "done":
 
             break
- 
+
         parsed = parse_blue_command(text_norm)
 
         if parsed is None:
@@ -695,11 +729,11 @@ def block5_human_command_interface(first_turn: bool = False) -> HumanPlan:
             print("Invalid command. Try again.")
 
             continue
- 
+
         commands.append(parsed)
 
         print("Accepted:", parsed)
- 
+
     return HumanPlan(parsed_commands=commands)
  
  
@@ -1292,7 +1326,7 @@ def main():
  
     # Block 5 initial commands
 
-    human_plan = block5_human_command_interface(first_turn=True)
+    human_plan = block5_human_command_interface(env, first_turn=True)
  
     while True:
 
@@ -1320,7 +1354,7 @@ def main():
 
                 print("\nReplan triggered.")
 
-                new_plan = block5_human_command_interface(first_turn=False)
+                new_plan = block5_human_command_interface(env, first_turn=False)
 
                 if new_plan.parsed_commands:
 
@@ -1421,6 +1455,21 @@ def main_pyquaticus() -> None:
 
     WALL_SAFETY_DIST = 18.0
     DEFENDER_HOLD_INSET = 15.0
+
+    def _pyquaticus_block5_env(
+        metric_robots: Dict[str, Robot],
+        blue_rids: List[str],
+        step_count: int,
+        cfg: Config,
+    ) -> EnvironmentState:
+        blue = {rid: metric_robots[rid] for rid in blue_rids if rid in metric_robots}
+        red = {rid: r for rid, r in metric_robots.items() if rid not in blue_rids}
+        return EnvironmentState(
+            blue_robots=blue,
+            red_robots=red,
+            timestep=step_count,
+            max_steps=cfg.max_steps_per_episode,
+        )
 
     def _angle_diff(a_deg: float, b_deg: float) -> float:
         return ((a_deg - b_deg) + 180) % 360 - 180
@@ -1541,6 +1590,7 @@ def main_pyquaticus() -> None:
         env_obj: Any,
         clock_obj: Any,
         first_turn: bool,
+        block5_env: EnvironmentState,
     ) -> HumanPlan:
         """
         Collect terminal commands without freezing pygame rendering.
@@ -1550,7 +1600,7 @@ def main_pyquaticus() -> None:
 
         def _worker() -> None:
             try:
-                result_q.put(block5_human_command_interface(first_turn=first_turn))
+                result_q.put(block5_human_command_interface(block5_env, first_turn=first_turn))
             except Exception as exc:  # pragma: no cover
                 result_q.put(exc)
 
@@ -1676,7 +1726,6 @@ def main_pyquaticus() -> None:
     last_block10_state: bool = False  # rising-edge detect to avoid replan spam
     # Previous world position per agent for dashboard attack compliance (moving toward goal).
     dash_prev_pos: Dict[str, Tuple[float, float]] = {}
-    # Previous min pairwise blue distance for dashboard spread_eval progress.
     dash_spread_prev_min: Optional[float] = None
 
     while True:
@@ -1741,11 +1790,13 @@ def main_pyquaticus() -> None:
         blue_zone_center = (float(_blue_home[0]), float(_blue_home[1]))
 
         if human_plan is None:
-            # Use sim_test.py Block 5 interface (move/hold/defend/attack/regroup/spread).
+            # Use Block 5 interface (move/hold/defend/attack/regroup/spread) + optional "0" summary.
+            block5_env = _pyquaticus_block5_env(metric_robots, blue_rids, step_count, cfg)
             new_plan = _prompt_commands_nonblocking(
                 env_obj=env,
                 clock_obj=clock,
                 first_turn=(step_count == 0),
+                block5_env=block5_env,
             )
             if new_plan.parsed_commands:
                 human_plan = new_plan
