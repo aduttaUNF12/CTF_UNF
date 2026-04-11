@@ -1283,7 +1283,7 @@ def print_status(env: EnvironmentState, summary: str, metrics_out: Dict[str, Any
 def main():
 
     random.seed(42)
- 
+
     # Block 1
 
     env = block1_environment_initialization()
@@ -1310,13 +1310,13 @@ def main():
 
         summary = block4_system_summary(global_state)
  
-        # Optional command refresh on replanning points
+        # Optional command refresh when Block 10 detects a strategic change.
 
         if env.timestep > 1:
 
-            replan = block10_strategic_change_detection(env, global_state)
+            replan_block10 = block10_strategic_change_detection(env, global_state)
 
-            if replan:
+            if replan_block10:
 
                 print("\nReplan triggered.")
 
@@ -1392,6 +1392,8 @@ def main_pyquaticus() -> None:
       - all attack red_base
       - all regroup at 60 30
       - all spread
+
+    Press R anytime to clear the current plan and prompt for new commands (same frame).
     """
     import pygame
     import threading
@@ -1419,7 +1421,7 @@ def main_pyquaticus() -> None:
         block12_termination_check,
     )
 
-    WALL_SAFETY_DIST = 18.0
+    WALL_SAFETY_DIST = 5.0
     DEFENDER_HOLD_INSET = 15.0
 
     def _angle_diff(a_deg: float, b_deg: float) -> float:
@@ -1663,6 +1665,8 @@ def main_pyquaticus() -> None:
 
     paused = False
     clock = pygame.time.Clock()
+    user_replan_requested = False
+    print("[PyQuaticus] Controls: SPACE pause | ESC quit | R strategic replan")
 
     # Prompt user per-plan; Block 10 decides when to clear for a new prompt.
     human_plan = None
@@ -1670,7 +1674,7 @@ def main_pyquaticus() -> None:
     # When replan clears `human_plan`, Block 5 "done" / empty line should reuse this snapshot.
     last_committed_human_plan: Optional[HumanPlan] = None
     step_count = 0
-    # Snapshot CTF state at plan time for event-driven replans (no periodic trigger).
+    # Snapshot CTF state at plan time for score/flag-driven replans.
     last_replan_ctf_state: Optional[Dict[str, Any]] = None
     last_user_commands: List[Dict[str, Any]] = []
     last_block10_state: bool = False  # rising-edge detect to avoid replan spam
@@ -1692,6 +1696,8 @@ def main_pyquaticus() -> None:
                     _sys.exit(0)
                 if event.key == pygame.K_SPACE:
                     paused = not paused
+                if event.key == pygame.K_r:
+                    user_replan_requested = True
 
         if paused:
             env.render()
@@ -1726,6 +1732,13 @@ def main_pyquaticus() -> None:
             "blue_has_red_flag": any(env.players[aid].has_flag for aid in blue_agents),
             "red_has_blue_flag": any(env.players[aid].has_flag for aid in red_agents),
         }
+
+        if user_replan_requested:
+            print("[Replan] User requested (R key) — enter new BLUE commands or 'done' to repeat last plan.")
+            human_plan = None
+            robot_assignments = None
+            last_replan_ctf_state = dict(ctf_state)
+            user_replan_requested = False
 
         # Block 4 — same `block4_system_summary` as grid-world, fed by PyQuaticus state.
         gs_block4 = _pyquaticus_global_state_for_block4(env, blue_agents, red_agents, step_count)
@@ -2171,7 +2184,11 @@ def main_pyquaticus() -> None:
                 bool(ctf_state.get("red_has_blue_flag", False))
                 and not bool(last_replan_ctf_state.get("red_has_blue_flag", False))
             )
-        should_replan = block10_rising or red_scored_since_plan or red_took_flag_since_plan
+        should_replan = (
+            block10_rising
+            or red_scored_since_plan
+            or red_took_flag_since_plan
+        )
         if should_replan:
             if red_scored_since_plan:
                 print("[Replan] Trigger: red score increased.")

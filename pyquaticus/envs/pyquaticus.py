@@ -1774,8 +1774,8 @@ class PyQuaticusEnv(PyQuaticusEnvBase):
         )
 
         # Controls
-        y = self.screen.get_height() - 50
-        for line in ("SPACE = Pause / Resume", "ESC = Quit"):
+        y = self.screen.get_height() - 70
+        for line in ("R = Replan","SPACE = Pause / Resume", "ESC = Quit"):
             self.screen.blit(
                 font_ctrls.render(line, True, (0, 0, 0)),
                 (20, y),

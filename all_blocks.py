@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any
+from collections import deque
 import random
 import math
 import heapq
@@ -913,6 +914,37 @@ def _build_grid(
     return grid
 
 
+def _snap_goal_to_nearest_free_cell(
+    grid: List[List[int]], goal: Vec2
+) -> Optional[Vec2]:
+    """
+    If goal sits on a blocked cell (e.g. inside boundary buffer), return the closest
+    free cell using 8-connected BFS from `goal`. If `goal` is already free, return it.
+    """
+    rows = len(grid)
+    if rows == 0:
+        return None
+    cols = len(grid[0])
+    gr, gc = goal
+    if 0 <= gr < rows and 0 <= gc < cols and grid[gr][gc] == 0:
+        return goal
+
+    q: deque[Vec2] = deque()
+    seen: set[Vec2] = set()
+    q.append((gr, gc))
+    seen.add((gr, gc))
+    while q:
+        r, c = q.popleft()
+        if 0 <= r < rows and 0 <= c < cols and grid[r][c] == 0:
+            return (r, c)
+        for dr, dc in _DIRECTION_TO_OFFSET.values():
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in seen:
+                seen.add((nr, nc))
+                q.append((nr, nc))
+    return None
+
+
 def _goal_world_from_hl_assignment(
     assignment: Dict[str, Any],
     opponent_flag_world: Tuple[float, float],
@@ -1031,6 +1063,12 @@ def block8_low_level_execution(
                 goal_col = clamp(start[1] + goal_offset_cells * dcol, 0, grid_cols - 1)
                 goal = (goal_row, goal_col)
 
+        snapped = _snap_goal_to_nearest_free_cell(grid, goal)
+        if snapped is None:
+            robot_actions.append({"robot_id": rid, "action": "HOLD"})
+            continue
+        goal = snapped
+
         if start == goal:
             robot_actions.append({"robot_id": rid, "action": "HOLD"})
             continue
@@ -1106,9 +1144,6 @@ def block9_environment_transition(gs: GlobalState, actions: List[Dict[str, Any]]
     return Reward(value=reward_val, breakdown=breakdown)
 
 
-# Replan every this many env steps (set 0 to disable periodic replan)
-REPLAN_INTERVAL_STEPS = 120
-
 # ==========================================================
 # BLOCK 10: CHECK FOR STRATEGIC CHANGES
 # ==========================================================
@@ -1122,33 +1157,27 @@ def block10_check_strategic_changes(
     Returns True if we should return to Human+LLM (steps 4–5). Caller should set human_plan = None.
 
     Checks:
-    1) Periodic: (gs.t - last_replan_step) >= REPLAN_INTERVAL_STEPS (if REPLAN_INTERVAL_STEPS > 0).
-    2) Plan failing: score_red increased since last replan (they just scored).
-    3) New threat: red_has_blue_flag just became True since last replan.
+    1) Plan failing: score_red increased since last replan (they just scored).
+    2) New threat: red_has_blue_flag just became True since last replan.
 
     ctf_state: score_blue, score_red, blue_has_red_flag, red_has_blue_flag.
     Caller must pass last_replan_step and last_replan_ctf_state and update them when this returns True.
     """
     if ctf_state is None:
         ctf_state = {}
-    step = gs.t
     sr = ctf_state.get("score_red", 0)
     red_has_blue = ctf_state.get("red_has_blue_flag", False)
 
-    # 1) Periodic replan
-    if REPLAN_INTERVAL_STEPS > 0 and step > 0 and last_replan_step >= 0 and (step - last_replan_step) >= REPLAN_INTERVAL_STEPS:
-        return True
-
-    # 2) Plan failing: they just scored since last replan
+    # 1) Plan failing: they just scored since last replan
     if last_replan_ctf_state is not None:
         prev_sr = last_replan_ctf_state.get("score_red", -1)
         if sr > prev_sr:
             return True
         prev_red_had = last_replan_ctf_state.get("red_has_blue_flag", False)
         if red_has_blue and not prev_red_had:
-            return True  # they just took our flag (new threat; see also check 3)
+            return True  # they just took our flag (new threat; see also 2b below)
 
-    # 3) New threat: red just took our flag since last replan
+    # 2b) New threat: red just took our flag since last replan
     if red_has_blue and last_replan_step >= 0 and last_replan_ctf_state is not None:
         prev_red_had = last_replan_ctf_state.get("red_has_blue_flag", False)
         if not prev_red_had:
