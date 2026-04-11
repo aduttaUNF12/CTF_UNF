@@ -2028,6 +2028,7 @@ def main_pyquaticus() -> None:
                     "prev_x": float(prev[0]),
                     "prev_y": float(prev[1]),
                     "is_tagged": bool(p.is_tagged),
+                    "has_flag": bool(p.has_flag),
                 }
             )
             dash_prev_pos[pid] = (cx, cy)
@@ -2057,7 +2058,8 @@ def main_pyquaticus() -> None:
         dash_spread_prev_min = min_pair
 
         # Progress-based command metrics (PyQuaticus): compliance at goal or moving closer;
-        # violation only if distance to target increases. Skip while tagged (not scored).
+        # violation only if distance to target increases. Skip while tagged or carrying flag
+        # (return-home / carrier behavior is not scored against the human waypoint).
         _pq_cmd_eps = 0.35
         _pq_goal_ok = 4.0
         if robot_assignments:
@@ -2067,6 +2069,10 @@ def main_pyquaticus() -> None:
                 except ValueError:
                     continue
                 if bool(env.players[aid].is_tagged):
+                    metrics.command_prev_dist.pop(rid, None)
+                    metrics.command_last_tgt.pop(rid, None)
+                    continue
+                if bool(env.players[aid].has_flag):
                     metrics.command_prev_dist.pop(rid, None)
                     metrics.command_last_tgt.pop(rid, None)
                     continue

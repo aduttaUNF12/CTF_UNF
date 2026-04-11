@@ -6,7 +6,8 @@ Kept separate from dashboard_tracker.py so the full analytics module stays uncha
 Compliance / violation match Block 11 in sim_test (progress-based, same eps):
   - Compliance: within goal radius OR distance to target decreased vs previous position.
   - Violation: distance to target increased vs previous position (and previous exists).
-  - Move/hold/attack: BLUE team only; events with is_tagged=True are not scored.
+  - Move/hold/attack: BLUE team only; events with is_tagged=True or has_flag=True are not scored
+    (carrier / return-home behavior would inflate violations).
   - Spread: uses prev_min_pairwise_blue on spread_eval events (team bunched vs last step).
 """
 
@@ -63,12 +64,14 @@ PQ_CMD_EPS = 0.35
 
 
 def _blue_untagged_move(ev: dict) -> bool:
-    """Human blue commands: only score BLUE agents that are not tagged."""
+    """Human blue commands: only score BLUE agents that are not tagged and not carrying the flag."""
     if str(ev.get("event")) != "move":
         return False
     if str(ev.get("team_id")) != "BLUE":
         return False
     if bool(ev.get("is_tagged")):
+        return False
+    if bool(ev.get("has_flag")):
         return False
     return True
 
