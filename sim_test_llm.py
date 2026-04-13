@@ -13,7 +13,14 @@ import math
 import random
 
 import re
- 
+import os
+import json
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None  # type: ignore[misc, assignment]
+
  
 # =========================================================
 
@@ -640,98 +647,161 @@ def parse_blue_command(text: str) -> Optional[ParsedCommand]:
     return None
  
  
-def generate_llm_summary(env: EnvironmentState) -> str:
+# ============================
+# Block 4: LLM-Based Context-Aware State Summary and Strategy Generation
+# ============================
 
+
+def build_game_state_payload(env: EnvironmentState, global_state: GlobalState) -> Dict[str, Any]:
     blue_alive = [r for r in env.blue_robots.values() if r.alive]
-
     red_alive = [r for r in env.red_robots.values() if r.alive]
 
-    summary = []
-
-    summary.append(f"Blue agents alive: {len(blue_alive)}")
-
-    summary.append(f"Red agents alive: {len(red_alive)}")
-
-    blue_positions = [f"{r.robot_id}:{r.position}" for r in blue_alive]
-
-    red_positions = [f"{r.robot_id}:{r.position}" for r in red_alive]
-
-    summary.append("Blue positions: " + ", ".join(blue_positions) if blue_positions else "No blue agents alive")
-
-    summary.append("Red positions: " + ", ".join(red_positions) if red_positions else "No red agents alive")
-
-    blue_score = sum(r.kills for r in env.blue_robots.values())
-
-    red_score = sum(r.kills for r in env.red_robots.values())
-
-    summary.append(f"Blue score: {blue_score}")
-
-    summary.append(f"Red score: {red_score}")
-
-    return "\n".join(summary)
+    return {
+        "game_type": "capture_the_flag",
+        "blue_alive": len(blue_alive),
+        "red_alive": len(red_alive),
+        "blue_positions": {r.robot_id: list(r.position) for r in blue_alive},
+        "red_positions": {r.robot_id: list(r.position) for r in red_alive},
+        "blue_score": sum(r.kills for r in env.blue_robots.values()),
+        "red_score": sum(r.kills for r in env.red_robots.values()),
+        "contested_regions": global_state.contested_regions,
+        "threat_map": global_state.threat_map,
+        "blue_base": list(global_state.blue_base),
+        "red_base": list(global_state.red_base),
+        "timestep": global_state.timestep,
+    }
 
 
-def block5_human_command_interface(env: EnvironmentState, first_turn: bool = False) -> HumanPlan:
+def _openai_client():
+    if OpenAI is None:
+        raise RuntimeError("Install the 'openai' package (pip install openai) to use LLM options 0 and 9.")
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("Set OPENAI_API_KEY in the environment to use LLM options 0 and 9.")
+    return OpenAI(api_key=key)
 
+
+def generate_llm_summary(env: EnvironmentState, global_state: GlobalState) -> str:
+    payload = build_game_state_payload(env, global_state)
+
+    prompt = f"""
+You are assisting a human commander in a capture-the-flag multi-agent game.
+
+Game context:
+
+- Blue and Red teams compete to score more points.
+
+- A point is scored by capturing the opponent's flag and returning safely.
+
+Write a short summary of the current situation.
+
+World state:
+
+{json.dumps(payload, indent=2)}
+
+"""
+
+    try:
+        client = _openai_client()
+        response = client.responses.create(
+            model="gpt-5.4",
+            input=prompt,
+        )
+        return response.output_text.strip()
+    except Exception as exc:  # pragma: no cover - network / API
+        return f"[LLM summary failed: {exc}]"
+
+
+def generate_top3_strategies(env: EnvironmentState, global_state: GlobalState) -> str:
+    payload = build_game_state_payload(env, global_state)
+
+    prompt = f"""
+You are a strategy planner for a capture-the-flag game.
+
+Generate top 3 strategies for BLUE team based on current situation.
+
+World state:
+
+{json.dumps(payload, indent=2)}
+
+Each strategy must include:
+
+- title
+
+- description
+
+- reason
+
+- risk (low/medium/high)
+
+"""
+
+    try:
+        client = _openai_client()
+        response = client.responses.create(
+            model="gpt-5.4",
+            input=prompt,
+        )
+        return response.output_text.strip()
+    except Exception as exc:  # pragma: no cover
+        return f"[LLM strategies failed: {exc}]"
+
+
+# ============================
+# Block 5: Human Command Interface with LLM Query Options
+# ============================
+
+
+def block5_human_command_interface(
+    env: EnvironmentState,
+    global_state: GlobalState,
+    first_turn: bool = False,
+) -> HumanPlan:
     if first_turn:
-
         print("\nEnter BLUE team commands.")
-
     else:
-
         print("\nEnter updated BLUE team commands, or type 'done' to keep current strategy.")
 
     print("\nOptions:")
-
-    print("0 -> Show current world state summary")
-
+    print("0 -> Show LLM world state summary")
+    print("9 -> Show top 3 LLM strategy suggestions")
     print("Type commands like:")
-
     print("all move to 4 4")
-
     print("robot B1 move to 3 5")
-
     print("all hold region R1")
-
     print("all attack red_base")
-
     print("all regroup at 2 2")
-
     print("all spread")
-
     print("Type 'done' OR press Enter on an empty line to finish.\n")
 
     commands: List[ParsedCommand] = []
 
     while True:
-
         text = input("BLUE CMD > ")
         text_norm = text.replace("\u200b", "").replace("\ufeff", "").strip()
 
         if text_norm == "0":
+            print("\n===== LLM SUMMARY =====")
+            print(generate_llm_summary(env, global_state))
+            print("========================\n")
+            continue
 
-            print("\n===== CURRENT WORLD STATE =====")
-
-            print(generate_llm_summary(env))
-
-            print("================================\n")
-
+        if text_norm == "9":
+            print("\n===== TOP 3 STRATEGIES =====")
+            print(generate_top3_strategies(env, global_state))
+            print("============================\n")
             continue
 
         if text_norm == "" or text_norm.lower() == "done":
-
             break
 
         parsed = parse_blue_command(text_norm)
 
         if parsed is None:
-
-            print("Invalid command. Try again.")
-
+            print("Invalid command.")
             continue
 
         commands.append(parsed)
-
         print("Accepted:", parsed)
 
     return HumanPlan(parsed_commands=commands)
@@ -1323,10 +1393,13 @@ def main():
     env = block1_environment_initialization()
 
     metrics = Metrics()
- 
+
+    local_obs0 = block2_local_observation(env)
+    global_state0 = block3_global_state_encoding(env, local_obs0)
+
     # Block 5 initial commands
 
-    human_plan = block5_human_command_interface(env, first_turn=True)
+    human_plan = block5_human_command_interface(env, global_state0, first_turn=True)
  
     while True:
 
@@ -1354,7 +1427,7 @@ def main():
 
                 print("\nReplan triggered.")
 
-                new_plan = block5_human_command_interface(env, first_turn=False)
+                new_plan = block5_human_command_interface(env, global_state, first_turn=False)
 
                 if new_plan.parsed_commands:
 
@@ -1419,6 +1492,8 @@ def main_pyquaticus() -> None:
     pyquaticus runner that reuses your Block 5/6/7/8 parsing + assignment pipeline.
 
     Command syntax matches this file's Block 5 (`parse_blue_command`):
+      - 0 -> LLM world summary (requires OPENAI_API_KEY + openai package)
+      - 9 -> top 3 LLM strategy suggestions for BLUE
       - all move to 40 30
       - robot B1 move to 35 20   (B# is accepted as an alias for R#)
       - all hold region R1
@@ -1432,8 +1507,6 @@ def main_pyquaticus() -> None:
     import pygame
     import threading
     import queue
-    import json
-    import os
     from datetime import datetime
     from pathlib import Path
     import sys as _sys
@@ -1593,6 +1666,7 @@ def main_pyquaticus() -> None:
         clock_obj: Any,
         first_turn: bool,
         block5_env: EnvironmentState,
+        global_state_gs: GlobalState,
     ) -> HumanPlan:
         """
         Collect terminal commands without freezing pygame rendering.
@@ -1602,7 +1676,11 @@ def main_pyquaticus() -> None:
 
         def _worker() -> None:
             try:
-                result_q.put(block5_human_command_interface(block5_env, first_turn=first_turn))
+                result_q.put(
+                    block5_human_command_interface(
+                        block5_env, global_state_gs, first_turn=first_turn
+                    )
+                )
             except Exception as exc:  # pragma: no cover
                 result_q.put(exc)
 
@@ -1810,6 +1888,7 @@ def main_pyquaticus() -> None:
                 clock_obj=clock,
                 first_turn=(step_count == 0),
                 block5_env=block5_env,
+                global_state_gs=gs_block4,
             )
             if new_plan.parsed_commands:
                 human_plan = new_plan
